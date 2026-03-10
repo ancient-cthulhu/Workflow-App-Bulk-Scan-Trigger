@@ -7,6 +7,7 @@ OUTPUT_FILE="vcbaseline.csv"
 
 ORG=""
 ORG_FILE=""
+GH_HOSTNAME=""
 DELETE_MODE=false
 ISSUE_TITLE="Veracode Baseline Scans"
 ISSUE_BODY="Veracode All Scans"
@@ -20,9 +21,18 @@ CALL_COUNT=0
 RATE_REMAINING=""
 RATE_RESET_EPOCH=""
 
+# Build the environment array for gh calls.
+gh_env() {
+  if [[ -n "$GH_HOSTNAME" ]]; then
+    env GH_HOST="$GH_HOSTNAME" "$@"
+  else
+    "$@"
+  fi
+}
+
 query_rate_limit() {
   local out remaining reset_epoch
-  out=$(gh api rate_limit --jq '.resources.core.remaining, .resources.core.reset' 2>/dev/null) || return 1
+  out=$(gh_env gh api rate_limit --jq '.resources.core.remaining, .resources.core.reset' 2>/dev/null) || return 1
   remaining=$(printf '%s\n' "$out" | sed -n '1p')
   reset_epoch=$(printf '%s\n' "$out" | sed -n '2p')
   [[ -n "$remaining" && -n "$reset_epoch" ]] || return 1
@@ -56,7 +66,7 @@ gh_call() {
 
   local tmp_out tmp_err status output err
   tmp_out="$(mktemp)"; tmp_err="$(mktemp)"
-  "$@" >"$tmp_out" 2>"$tmp_err"
+  gh_env "$@" >"$tmp_out" 2>"$tmp_err"
   status=$?
   output="$(cat "$tmp_out")"
   err="$(cat "$tmp_err")"
@@ -82,7 +92,7 @@ gh_call() {
     fi
 
     tmp_out="$(mktemp)"; tmp_err="$(mktemp)"
-    "$@" >"$tmp_out" 2>"$tmp_err"
+    gh_env "$@" >"$tmp_out" 2>"$tmp_err"
     status=$?
     output="$(cat "$tmp_out")"
     err="$(cat "$tmp_err")"
@@ -109,6 +119,9 @@ while [[ $# -gt 0 ]]; do
     --org-file)
       ORG_FILE="$2"; shift 2
       ;;
+    --hostname)
+      GH_HOSTNAME="$2"; shift 2
+      ;;
     --repo-limit)
       REPO_LIST_LIMIT="$2"; shift 2
       ;;
@@ -129,7 +142,7 @@ while [[ $# -gt 0 ]]; do
       fi
       ;;
     --help|-h)
-      echo "Usage: $0 [--delete] [--org-file FILE | <github-org-name>] [--repo-limit N] [--min-remaining N] [--rl-check-every N]"
+      echo "Usage: $0 [--delete] [--org-file FILE | <github-org-name>] [--hostname HOSTNAME] [--repo-limit N] [--min-remaining N] [--rl-check-every N]"
       echo
       echo "Org input (choose one):"
       echo "  <github-org-name>    Single org name as a positional argument."
@@ -137,6 +150,11 @@ while [[ $# -gt 0 ]]; do
       echo
       echo "Options:"
       echo "  --delete             Close previously created trigger issues instead of creating new ones."
+      echo "  --hostname HOSTNAME  GitHub hostname. Omit for github.com."
+      echo "                       GHES example: github.mycompany.com"
+      echo "                       GHEC example: myorg.ghe.com"
+      echo "                       Sets GH_HOST per-call without modifying your shell."
+      echo "                       Ensure GH_ENTERPRISE_TOKEN (GHES) or GH_TOKEN (GHEC/github.com) is set."
       echo "  --repo-limit N       Max repos to fetch per org (default: ${REPO_LIST_LIMIT})."
       echo "  --min-remaining N    Pause when Core API remaining <= N (default: ${GH_RL_MIN_REMAINING})."
       echo "  --rl-check-every N   Check rate limit every N gh calls (default: ${GH_RL_CHECK_EVERY})."
@@ -156,19 +174,28 @@ if [[ -n "$ORG" && -n "$ORG_FILE" ]]; then
 fi
 
 if [[ -z "$ORG" && -z "$ORG_FILE" ]]; then
-  echo "Usage: $0 [--delete] [--org-file FILE | <github-org-name>] [--repo-limit N] [--min-remaining N] [--rl-check-every N]"
+  echo "Usage: $0 [--delete] [--org-file FILE | <github-org-name>] [--hostname HOSTNAME] [--repo-limit N] [--min-remaining N] [--rl-check-every N]"
   echo
   echo "Examples:"
   echo "  $0 my-org"
   echo "  $0 --org-file orgs.txt"
+  echo "  $0 --hostname github.mycompany.com --org-file orgs.txt"
   echo "  $0 --delete --org-file orgs.txt"
-  echo "  $0 --repo-limit 5000 --org-file orgs.txt"
   exit 1
 fi
 
 if ! command -v gh >/dev/null 2>&1; then
   echo "Error: GitHub CLI (gh) is not installed." >&2
   exit 1
+fi
+
+# Warn if targeting GHES without GH_ENTERPRISE_TOKEN
+if [[ -n "$GH_HOSTNAME" ]]; then
+  # ghe.com subdomains are GHEC and use GH_TOKEN; anything else is GHES
+  if [[ "$GH_HOSTNAME" != *".ghe.com" ]] && [[ -z "${GH_ENTERPRISE_TOKEN:-}" ]]; then
+    echo "Warning: --hostname is set to '$GH_HOSTNAME' but GH_ENTERPRISE_TOKEN is not set. Authentication may fail for GHES. Set GH_ENTERPRISE_TOKEN before running." >&2
+  fi
+  echo "Targeting GitHub host: $GH_HOSTNAME"
 fi
 
 # -------------------------
@@ -182,10 +209,8 @@ if [[ -n "$ORG_FILE" ]]; then
     exit 1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
-    # Strip leading/trailing whitespace
     trimmed="${line#"${line%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-    # Skip blank lines and comments
     [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
     ORGS+=("$trimmed")
   done < "$ORG_FILE"

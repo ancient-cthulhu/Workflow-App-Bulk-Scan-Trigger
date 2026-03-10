@@ -2,7 +2,7 @@
 
 ## Overview
 
-This script is executed **locally using GitHub CLI** to create (or clean up) GitHub issues across repositories in a GitHub organization.  
+This script is executed **locally using GitHub CLI** to create (or clean up) GitHub issues across repositories in one or more GitHub organizations.  
 These issues act as **triggers for the Veracode Workflow App**, initiating scans based on the `veracode.yml` configuration.
 
 Two versions of the script are available:
@@ -10,7 +10,7 @@ Two versions of the script are available:
 - `script.sh` - Bash version (Linux, macOS, WSL2)
 - `script.py` - Python port with identical behavior and flags
 
-Both versions are functionally equivalent. The Python version is provided as an alternative for environments where Python is preferred or Bash is unavailable.
+Both versions are functionally equivalent and support GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES). The Python version is provided as an alternative for environments where Python is preferred or Bash is unavailable.
 
 ---
 
@@ -73,11 +73,40 @@ python --version
 
 ## Authentication and Permissions
 
-Authenticate the GitHub CLI before running either version:
+### GitHub.com and GHEC
+
+Authenticate interactively before running:
 
 ```bash
 gh auth login
 ```
+
+Or set a token in the environment (useful for automation):
+
+```bash
+export GH_TOKEN=ghp_yourtoken
+```
+
+### GitHub Enterprise Server (GHES)
+
+Authenticate against your GHES instance:
+
+```bash
+gh auth login --hostname github.mycompany.com
+```
+
+Or set the token and hostname in the environment:
+
+```bash
+export GH_ENTERPRISE_TOKEN=ghp_yourtoken
+export GH_HOST=github.mycompany.com
+```
+
+When using the `--hostname` flag (see Running the Script below), the script sets `GH_HOST` automatically for every `gh` call without requiring you to export it in your shell. You still need to set `GH_ENTERPRISE_TOKEN` (GHES) or `GH_TOKEN` (GitHub.com / GHEC) before running.
+
+The script will warn you if `--hostname` is set to a GHES instance but `GH_ENTERPRISE_TOKEN` is not found in the environment.
+
+### Required Permissions
 
 The authenticated user must have:
 
@@ -139,46 +168,111 @@ No additional dependencies or virtual environments are required - the Python ver
 
 ## Running the Script
 
-All flags and behavior are identical between the Bash and Python versions. Simply substitute `./script.sh` with `python3 script.py` (or `./script.py` if made executable).
+All flags and behavior are identical between the Bash and Python versions. Simply substitute `./script.sh` with `python script.py` (or `./script.py` if made executable).
 
-### Trigger Scans / Create Issues Mode (Default)
+### Single Org Mode
+
+Pass the org name as a positional argument:
 
 ```bash
 # Bash
-./script.sh <github-org-name>
+./script.sh my-github-org
 
 # Python
-python script.py <github-org-name>
-```
-
-Example:
-
-```bash
-./script.sh my-github-org
 python script.py my-github-org
 ```
 
-### Delete Issues Mode
+### Multi-Org Mode (org file)
+
+Use `--org-file` to point to a text file with one org per line. Lines starting with `#` and blank lines are ignored.
+
+Example `orgs.txt`:
+
+```
+# One org name per line
+# Lines starting with # are treated as comments
+
+acme-dev
+acme-staging
+acme-prod
+acme-archive
+```
 
 ```bash
 # Bash
-./script.sh --delete <github-org-name>
+./script.sh --org-file orgs.txt
 
 # Python
-python script.py --delete <github-org-name>
+python script.py --org-file orgs.txt
 ```
 
+Before processing begins, the script checks access to **all orgs in the file** and aborts if any are inaccessible - so there are no partial runs due to a typo or permission issue mid-way through.
+
+Each org prints its own per-org stats block as it completes. At the end, a rolled-up summary table is printed across all orgs.
+
+> Note: `--org-file` and a positional org name are mutually exclusive. Use one or the other.
+
+### Delete Issues Mode
+
+Works with both single org and org file:
+
+```bash
+# Bash
+./script.sh --delete my-github-org
+./script.sh --delete --org-file orgs.txt
+
+# Python
+python script.py --delete my-github-org
+python script.py --delete --org-file orgs.txt
+```
+
+### GitHub Enterprise Server (GHES)
+
+Use `--hostname` to target a GHES instance. The script sets `GH_HOST` for every `gh` call internally - no need to export it in your shell. Set `GH_ENTERPRISE_TOKEN` before running.
+
+```bash
+export GH_ENTERPRISE_TOKEN=ghp_yourtoken
+
+# Bash
+./script.sh --hostname github.mycompany.com my-org
+./script.sh --hostname github.mycompany.com --org-file orgs.txt
+
+# Python
+python script.py --hostname github.mycompany.com my-org
+python script.py --hostname github.mycompany.com --org-file orgs.txt
+```
+
+### GitHub Enterprise Cloud (GHEC)
+
+GHEC uses `GH_TOKEN` (same as GitHub.com). Use `--hostname` with your GHEC subdomain if needed:
+
+```bash
+export GH_TOKEN=ghp_yourtoken
+
+# Bash
+./script.sh --hostname myorg.ghe.com my-org
+
+# Python
+python script.py --hostname myorg.ghe.com my-org
+```
+
+> Note: For most GHEC setups authenticated with `gh auth login`, `--hostname` is not required as `gh` will already be configured for the correct host.
+
 ### Large Organizations (More Than 1,000 Repos)
+
+`--repo-limit` applies per org:
 
 ```bash
 # Bash
 ./script.sh --repo-limit 5000 my-github-org
+./script.sh --repo-limit 5000 --org-file orgs.txt
 
 # Python
 python script.py --repo-limit 5000 my-github-org
+python script.py --repo-limit 5000 --org-file orgs.txt
 ```
 
-> Tip: You can set `--repo-limit` higher than 1000 for very large orgs. The script remains safe by pacing itself using rate-limit checks (see below).
+> Tip: You can set `--repo-limit` higher than 1000 for very large orgs, the script paces itself using rate-limit checks (see below).
 
 ### Usage Help
 
@@ -204,14 +298,16 @@ To keep things simple and reliable at scale, the script uses **proactive GitHub 
 
 **Examples:**
 
-Be extra cautious for very large orgs:
+Be cautious for very large orgs:
 
 ```bash
 # Bash
 ./script.sh --repo-limit 10000 --min-remaining 200 --rl-check-every 25 my-github-org
+./script.sh --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
 
 # Python
 python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 my-github-org
+python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
 ```
 
 Keep defaults (still safe for thousands of repos):
@@ -232,10 +328,11 @@ python script.py --repo-limit 5000 my-github-org
 
 ### CSV Report
 
-A file named `vcbaseline.csv` is generated in the working directory by both versions.
+A file named `vcbaseline.csv` is generated in the working directory by both versions. When running in multi-org mode, all orgs are written to the same CSV file with an `org` column added as the first field.
 
 #### Create Mode Fields:
 
+- `org`
 - `repo`
 - `primary_language`
 - `issues_enabled`
@@ -252,6 +349,7 @@ Common `action` values:
 
 #### Delete Mode Fields:
 
+- `org`
 - `repo`
 - `primary_language`
 - `is_archived`
@@ -265,7 +363,7 @@ Common `action` values:
 - `no_issues_found`
 - `skipped_archived`
 
-The CSV serves as the execution audit trail.
+The CSV serves as the execution audit trail. In multi-org runs, filtering by the `org` column isolates results per organization.
 
 ---
 
@@ -286,7 +384,7 @@ To re-trigger scans:
 - Veracode onboarding at scale
 - Organization-wide scan triggering
 - Periodic re-scans
-- DevSecOps automation
+- Local DevSecOps automation
 - Cleanup of trigger issues after scan completion
 
 ---
@@ -297,17 +395,30 @@ To re-trigger scans:
   - The script automatically sleeps until reset and retries.
   - To be extra safe, lower the check interval and raise the remaining threshold:
     ```bash
-    ./script.sh --min-remaining 200 --rl-check-every 25 my-github-org
-    python script.py --min-remaining 200 --rl-check-every 25 my-github-org
+    ./script.sh --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+    python script.py --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
     ```
+
+- **"Cannot access the following org(s)" on startup**
+  - The script validates access to all orgs before doing any work. Check for typos in the org file, or that your `gh auth login` token has access to all listed orgs.
+  - Fix the issue and retry - no partial state is written until the run starts.
+
+- **"No org names found" when using --org-file**
+  - Every line in the file is either blank or starts with `#`. Add at least one uncommented org name.
 
 - **"Could not enable issues" on some repositories**
   - Your token/account likely lacks admin permissions on those repos.
   - The script skips them and logs the reason in the CSV.
 
-- **Python version: "python3: command not found"**
-  - Ensure Python 3.10+ is installed and on your PATH.
-
 - **Python version: "SyntaxError" or unexpected failures**
   - The Python version requires Python 3.10 or newer due to `list[str]` type hint syntax.
   - Check your version with `python --version` and upgrade if needed.
+
+- **GHES: "authentication failed" or "Could not resolve host"**
+  - Ensure `GH_ENTERPRISE_TOKEN` is set and that `gh auth login --hostname your.ghes.host` has been run at least once.
+  - Pass `--hostname your.ghes.host` explicitly so the script targets the right instance.
+  - Confirm network connectivity to the GHES host from your local machine.
+
+- **GHEC: targeting the wrong GitHub instance**
+  - If authenticated to both GitHub.com and GHEC, use `--hostname myorg.ghe.com` to force the correct host.
+  - GHEC uses `GH_TOKEN`, not `GH_ENTERPRISE_TOKEN`.

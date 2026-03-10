@@ -2,6 +2,7 @@
 """
 script.py - Create or close Veracode baseline scan trigger issues across all repos in a GitHub org.
 Supports a single org (positional arg) or multiple orgs via --org-file.
+Supports GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES) via --hostname.
 """
 
 import argparse
@@ -35,7 +36,20 @@ class RateLimitState:
 rate_limit_state = RateLimitState()
 
 
-def query_rate_limit() -> bool:
+def build_gh_env(gh_hostname: str | None) -> dict:
+    """
+    Build the subprocess environment for gh calls.
+    If a hostname is provided, sets GH_HOST so all gh commands target that host.
+    Inherits the full current environment so existing GH_TOKEN / GH_ENTERPRISE_TOKEN
+    credentials are picked up automatically.
+    """
+    env = os.environ.copy()
+    if gh_hostname:
+        env["GH_HOST"] = gh_hostname
+    return env
+
+
+def query_rate_limit(gh_hostname: str | None) -> bool:
     """Query GitHub core REST rate limit. Updates global state. Returns True on success."""
     try:
         result = subprocess.run(
@@ -43,6 +57,7 @@ def query_rate_limit() -> bool:
             capture_output=True,
             text=True,
             check=True,
+            env=build_gh_env(gh_hostname),
         )
         lines = result.stdout.strip().splitlines()
         if len(lines) < 2:
@@ -54,14 +69,14 @@ def query_rate_limit() -> bool:
         return False
 
 
-def maybe_pause_for_rate_limit(min_remaining: int, check_every: int) -> None:
+def maybe_pause_for_rate_limit(min_remaining: int, check_every: int, gh_hostname: str | None) -> None:
     """Proactively pause if remaining API calls are low."""
     rate_limit_state.call_count += 1
 
     if rate_limit_state.call_count % check_every != 0:
         return
 
-    if not query_rate_limit():
+    if not query_rate_limit(gh_hostname):
         return
 
     if rate_limit_state.remaining <= min_remaining:
@@ -77,16 +92,24 @@ def maybe_pause_for_rate_limit(min_remaining: int, check_every: int) -> None:
             time.sleep(sleep_for)
 
 
-def gh_call(args: list[str], min_remaining: int, check_every: int) -> tuple[bool, str, str]:
+def gh_call(
+    args: list[str],
+    min_remaining: int,
+    check_every: int,
+    gh_hostname: str | None = None,
+) -> tuple[bool, str, str]:
     """
     Run a gh CLI command with proactive and reactive rate limit handling.
-    Returns (success, stdout, stderr).
-    Retries once after sleeping if rate limited.
+    Injects GH_HOST into the subprocess environment if gh_hostname is provided,
+    so all calls target the correct GitHub instance without modifying the parent shell.
+    Returns (success, stdout, stderr). Retries once after sleeping if rate limited.
     """
-    maybe_pause_for_rate_limit(min_remaining, check_every)
+    maybe_pause_for_rate_limit(min_remaining, check_every, gh_hostname)
+
+    env = build_gh_env(gh_hostname)
 
     def run_command() -> tuple[bool, str, str]:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, env=env)
         return result.returncode == 0, result.stdout, result.stderr
 
     success, stdout, stderr = run_command()
@@ -101,7 +124,7 @@ def gh_call(args: list[str], min_remaining: int, check_every: int) -> tuple[bool
     is_rate_limited = any(indicator.lower() in combined_output for indicator in rate_limit_indicators)
 
     if is_rate_limited:
-        if query_rate_limit():
+        if query_rate_limit(gh_hostname):
             now = int(time.time())
             sleep_for = rate_limit_state.reset_epoch - now + 1
             if sleep_for > 0:
@@ -124,36 +147,37 @@ def load_orgs_from_file(file_path: str) -> list[str]:
     Parse an org list file. Returns a list of org names.
     Skips blank lines and lines starting with #.
     """
-    path = file_path
-    if not os.path.isfile(path):
-        print(f"Error: Org file not found: {path}", file=sys.stderr)
+    if not os.path.isfile(file_path):
+        print(f"Error: Org file not found: {file_path}", file=sys.stderr)
         sys.exit(1)
 
     orgs = []
-    with open(path) as f:
-        for line_num, raw_line in enumerate(f, start=1):
+    with open(file_path) as f:
+        for raw_line in f:
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
             orgs.append(line)
 
     if not orgs:
-        print(f"Error: No org names found in '{path}' (all lines are blank or comments).", file=sys.stderr)
+        print(f"Error: No org names found in '{file_path}' (all lines are blank or comments).", file=sys.stderr)
         sys.exit(1)
 
     return orgs
 
 
-def check_org_access(org: str, min_remaining: int, check_every: int) -> bool:
+def check_org_access(org: str, min_remaining: int, check_every: int, gh_hostname: str | None) -> bool:
     """Returns True if the authenticated user can access the org."""
     success, _, _ = gh_call(
         ["gh", "api", f"orgs/{org}", "--silent"],
-        min_remaining, check_every,
+        min_remaining, check_every, gh_hostname,
     )
     return success
 
 
-def fetch_repos(org: str, limit: int, min_remaining: int, check_every: int) -> list[dict]:
+def fetch_repos(
+    org: str, limit: int, min_remaining: int, check_every: int, gh_hostname: str | None
+) -> list[dict]:
     """Fetch all repos for the org as a list of dicts."""
     jq_query = (
         "[.[] | {"
@@ -166,8 +190,7 @@ def fetch_repos(org: str, limit: int, min_remaining: int, check_every: int) -> l
     success, stdout, _ = gh_call(
         ["gh", "repo", "list", org, "--limit", str(limit), "--json",
          "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived", "--jq", jq_query],
-        min_remaining,
-        check_every,
+        min_remaining, check_every, gh_hostname,
     )
     if not success:
         print(f"Error: Failed to fetch repos for org '{org}'.", file=sys.stderr)
@@ -175,13 +198,14 @@ def fetch_repos(org: str, limit: int, min_remaining: int, check_every: int) -> l
     return json.loads(stdout.strip()) if stdout.strip() else []
 
 
-def find_open_issues(repo: str, title: str, min_remaining: int, check_every: int) -> list[int]:
+def find_open_issues(
+    repo: str, title: str, min_remaining: int, check_every: int, gh_hostname: str | None
+) -> list[int]:
     """Return list of open issue numbers matching the given title."""
     success, stdout, _ = gh_call(
         ["gh", "issue", "list", "--repo", repo, "--state", "open",
          "--search", f"{title} in:title", "--json", "number", "--jq", "[.[].number]"],
-        min_remaining,
-        check_every,
+        min_remaining, check_every, gh_hostname,
     )
     if not success or not stdout.strip():
         return []
@@ -202,6 +226,7 @@ def run_delete_mode(
     csv_writer: csv.DictWriter,
     min_remaining: int,
     check_every: int,
+    gh_hostname: str | None,
 ) -> dict:
     """
     Close all open trigger issues across org repos.
@@ -231,7 +256,7 @@ def run_delete_mode(
             })
             continue
 
-        issue_numbers = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every)
+        issue_numbers = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every, gh_hostname)
 
         if not issue_numbers:
             print("No matching issues found.")
@@ -249,8 +274,7 @@ def run_delete_mode(
             success, _, _ = gh_call(
                 ["gh", "issue", "close", str(issue_num), "--repo", name,
                  "--comment", "Closed by cleanup script"],
-                min_remaining,
-                check_every,
+                min_remaining, check_every, gh_hostname,
             )
             if success:
                 issues_deleted += 1
@@ -292,6 +316,7 @@ def run_create_mode(
     csv_writer: csv.DictWriter,
     min_remaining: int,
     check_every: int,
+    gh_hostname: str | None,
 ) -> dict:
     """
     Create baseline scan trigger issues across org repos.
@@ -328,7 +353,7 @@ def run_create_mode(
             print("Issues are disabled. Temporarily enabling...")
             success, _, _ = gh_call(
                 ["gh", "repo", "edit", name, "--enable-issues"],
-                min_remaining, check_every,
+                min_remaining, check_every, gh_hostname,
             )
             if not success:
                 print("Could not enable issues. Skipping issue creation.")
@@ -341,14 +366,14 @@ def run_create_mode(
                 continue
             was_disabled = True
 
-        existing_issues = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every)
+        existing_issues = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every, gh_hostname)
 
         if existing_issues:
             print("Open issue with same title already exists. Skipping.")
             skipped_existing_count += 1
             if was_disabled:
                 print("Restoring state: Disabling issues...")
-                gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every)
+                gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every, gh_hostname)
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "issues_enabled": issues_enabled, "is_archived": is_archived,
@@ -359,7 +384,7 @@ def run_create_mode(
         print("Creating issue...")
         success, _, _ = gh_call(
             ["gh", "issue", "create", "--repo", name, "--title", ISSUE_TITLE, "--body", ISSUE_BODY],
-            min_remaining, check_every,
+            min_remaining, check_every, gh_hostname,
         )
 
         if success:
@@ -372,7 +397,7 @@ def run_create_mode(
 
         if was_disabled:
             print("Restoring state: Disabling issues...")
-            gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every)
+            gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every, gh_hostname)
 
         csv_writer.writerow({
             "org": org, "repo": name, "primary_language": primary_lang,
@@ -445,7 +470,10 @@ def print_multi_org_summary(all_stats: list[dict], delete_mode: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create or close Veracode baseline scan trigger issues across one or more GitHub orgs."
+        description=(
+            "Create or close Veracode baseline scan trigger issues across one or more GitHub orgs. "
+            "Supports GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES)."
+        )
     )
 
     org_group = parser.add_mutually_exclusive_group(required=True)
@@ -454,6 +482,16 @@ def main() -> None:
                            help="Path to a text file with one org name per line (# lines are comments)")
 
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
+    parser.add_argument(
+        "--hostname", metavar="HOSTNAME", default=None,
+        help=(
+            "GitHub hostname to target. Omit for github.com. "
+            "For GHES: your instance hostname e.g. github.mycompany.com. "
+            "For GHEC: your enterprise subdomain e.g. myorg.ghe.com. "
+            "Sets GH_HOST for all gh calls without modifying your shell environment. "
+            "Ensure GH_ENTERPRISE_TOKEN (GHES) or GH_TOKEN (GHEC/github.com) is set before running."
+        ),
+    )
     parser.add_argument("--repo-limit", type=int, default=DEFAULT_REPO_LIST_LIMIT,
                         help=f"Max repos to fetch per org (default: {DEFAULT_REPO_LIST_LIMIT})")
     parser.add_argument("--min-remaining", type=int, default=DEFAULT_RL_MIN_REMAINING,
@@ -466,6 +504,19 @@ def main() -> None:
     if subprocess.run(["which", "gh"], capture_output=True).returncode != 0:
         print("Error: GitHub CLI (gh) is not installed.", file=sys.stderr)
         sys.exit(1)
+
+    gh_hostname = args.hostname
+
+    # Warn if targeting GHES without GH_ENTERPRISE_TOKEN set
+    if gh_hostname and "ghe.com" not in gh_hostname and not os.environ.get("GH_ENTERPRISE_TOKEN"):
+        print(
+            f"Warning: --hostname is set to '{gh_hostname}' but GH_ENTERPRISE_TOKEN is not set. "
+            "Authentication may fail for GHES. Set GH_ENTERPRISE_TOKEN before running.",
+            file=sys.stderr,
+        )
+
+    if gh_hostname:
+        print(f"Targeting GitHub host: {gh_hostname}")
 
     # Resolve org list
     if args.org_file:
@@ -482,7 +533,7 @@ def main() -> None:
     inaccessible_orgs = []
     for org in orgs:
         print(f"  Checking {org}...", end=" ")
-        if check_org_access(org, args.min_remaining, args.rl_check_every):
+        if check_org_access(org, args.min_remaining, args.rl_check_every, gh_hostname):
             print("OK")
         else:
             print("FAILED")
@@ -509,15 +560,14 @@ def main() -> None:
         for org_index, org in enumerate(orgs, start=1):
             print_org_header(org, org_index, total_orgs)
 
-            repos = fetch_repos(org, args.repo_limit, args.min_remaining, args.rl_check_every)
-            if repos is None:
-                # fetch_repos already printed the error; record a failed org and continue
+            repos = fetch_repos(org, args.repo_limit, args.min_remaining, args.rl_check_every, gh_hostname)
+            if not repos:
                 continue
 
             if args.delete:
-                stats = run_delete_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every)
+                stats = run_delete_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every, gh_hostname)
             else:
-                stats = run_create_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every)
+                stats = run_create_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every, gh_hostname)
 
             all_stats.append(stats)
 

@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -501,7 +502,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Validate gh CLI is available
-    if subprocess.run(["which", "gh"], capture_output=True).returncode != 0:
+    if shutil.which("gh") is None:
         print("Error: GitHub CLI (gh) is not installed.", file=sys.stderr)
         sys.exit(1)
 

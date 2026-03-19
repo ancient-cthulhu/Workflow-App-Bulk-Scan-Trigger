@@ -5,44 +5,132 @@ Supports a single org (positional arg) or multiple orgs via --org-file.
 Supports GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES) via --hostname.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-OUTPUT_FILE = "vcbaseline.csv"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 ISSUE_TITLE = "Veracode Baseline Scans"
 ISSUE_BODY = "Veracode All Scans"
-IAC_LANGUAGES = {"HCL", "Bicep"}
+IAC_LANGUAGES = frozenset({"HCL", "Bicep"})
+SUBPROCESS_TIMEOUT = 60
+DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
 
-# Rate limit defaults (overridable via env or CLI flags)
-DEFAULT_RL_MIN_REMAINING = int(os.environ.get("GH_RL_MIN_REMAINING", 100))
-DEFAULT_RL_CHECK_EVERY = int(os.environ.get("GH_RL_CHECK_EVERY", 50))
-DEFAULT_REPO_LIST_LIMIT = int(os.environ.get("REPO_LIST_LIMIT", 1000))
+_VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,38}$")
 
+_REPO_JQ = (
+    "[.[] | {"
+    "nameWithOwner: .nameWithOwner, "
+    "hasIssuesEnabled: .hasIssuesEnabled, "
+    "primaryLanguage: (.primaryLanguage.name // \"N/A\"), "
+    "isArchived: .isArchived"
+    "}]"
+)
+
+_RATE_LIMIT_PATTERNS = (
+    "rate limit",
+    "secondary rate",
+    "abuse detection",
+    "http 403",
+    "api rate limit exceeded",
+)
+
+
+class OrgFileError(Exception):
+    """Raised for unrecoverable org-file loading failures. Caught in main()."""
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers (module-level reads, safe against bad env values)
+# ---------------------------------------------------------------------------
+
+def _env_int(key: str, default: int) -> int:
+    """Read an integer from the environment, falling back to default on bad values."""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        print(
+            f"Warning: {key}={val!r} is not a valid integer, using default {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+DEFAULT_RL_MIN_REMAINING = _env_int("GH_RL_MIN_REMAINING", 100)
+DEFAULT_RL_CHECK_EVERY   = _env_int("GH_RL_CHECK_EVERY", 50)
+DEFAULT_REPO_LIST_LIMIT  = _env_int("REPO_LIST_LIMIT", 1000)
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RateLimitState:
+    """
+    Tracks GitHub Core REST rate-limit state across gh calls.
+    reset_epoch=0 is the uninitialised sentinel; it is only meaningful
+    after a successful query_rate_limit() call.
+    """
     call_count: int = 0
     remaining: int = 9999
     reset_epoch: int = 0
 
 
-rate_limit_state = RateLimitState()
-
-
-def build_gh_env(gh_hostname: str | None) -> dict:
+@dataclass
+class GhContext:
     """
-    Build the subprocess environment for gh calls.
-    If a hostname is provided, sets GH_HOST so all gh commands target that host.
-    Inherits the full current environment so existing GH_TOKEN / GH_ENTERPRISE_TOKEN
-    credentials are picked up automatically.
+    Bundles the four values that travel together through every gh call.
+    Pass one GhContext instead of four separate parameters.
+    """
+    env: dict[str, str]
+    state: RateLimitState
+    min_remaining: int
+    check_every: int
+
+
+@dataclass
+class OrgStats:
+    org: str
+    total_repos: int = 0
+    archived: int = 0
+    # create mode
+    iac: int = 0
+    skipped_perm: int = 0
+    skipped_existing: int = 0
+    created: int = 0
+    # delete mode
+    skipped_no_issues: int = 0
+    deleted: int = 0
+    # shared
+    failed: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Environment / org helpers
+# ---------------------------------------------------------------------------
+
+def build_gh_env(gh_hostname: str | None) -> dict[str, str]:
+    """
+    Return a copy of the current environment, optionally with GH_HOST injected.
+    Build once per run in main() and store in GhContext.
     """
     env = os.environ.copy()
     if gh_hostname:
@@ -50,92 +138,147 @@ def build_gh_env(gh_hostname: str | None) -> dict:
     return env
 
 
-def query_rate_limit(gh_hostname: str | None) -> bool:
-    """Query GitHub core REST rate limit. Updates global state. Returns True on success."""
+def validate_org_name(org: str) -> bool:
+    """Return True if org is a plausible GitHub org slug."""
+    return bool(_VALID_ORG_RE.match(org))
+
+
+def load_orgs_from_file(file_path: str) -> list[str]:
+    """Parse an org list file. Validates all names before returning.
+
+    Raises:
+        OrgFileError: if the file is missing, empty, or contains invalid org names.
+    """
+    if not os.path.isfile(file_path):
+        raise OrgFileError(f"Org file not found: {file_path}")
+
+    with open(file_path, encoding="utf-8") as fh:
+        orgs = [
+            stripped for line in fh
+            if (stripped := line.strip()) and not stripped.startswith("#")
+        ]
+
+    if not orgs:
+        raise OrgFileError(
+            f"No org names found in '{file_path}' (all lines are blank or comments)."
+        )
+
+    invalid = [o for o in orgs if not validate_org_name(o)]
+    if invalid:
+        raise OrgFileError(
+            f"Invalid org name(s) in '{file_path}': {', '.join(invalid)}"
+        )
+
+    return orgs
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+def query_rate_limit(ctx: GhContext) -> bool:
+    """Query GitHub core REST rate limit. Updates ctx.state. Returns True on success."""
     try:
         result = subprocess.run(
             ["gh", "api", "rate_limit", "--jq", ".resources.core.remaining, .resources.core.reset"],
             capture_output=True,
             text=True,
             check=True,
-            env=build_gh_env(gh_hostname),
+            env=ctx.env,
+            timeout=SUBPROCESS_TIMEOUT,
         )
         lines = result.stdout.strip().splitlines()
         if len(lines) < 2:
             return False
-        rate_limit_state.remaining = int(lines[0])
-        rate_limit_state.reset_epoch = int(lines[1])
+        ctx.state.remaining = int(lines[0])
+        ctx.state.reset_epoch = int(lines[1])
         return True
-    except (subprocess.CalledProcessError, ValueError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return False
 
 
-def maybe_pause_for_rate_limit(min_remaining: int, check_every: int, gh_hostname: str | None) -> None:
+def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
     """Proactively pause if remaining API calls are low."""
-    rate_limit_state.call_count += 1
+    ctx.state.call_count += 1
 
-    if rate_limit_state.call_count % check_every != 0:
+    # Check on the first call and then every N calls thereafter
+    if ctx.state.call_count != 1 and ctx.state.call_count % ctx.check_every != 0:
         return
 
-    if not query_rate_limit(gh_hostname):
+    if not query_rate_limit(ctx):
         return
 
-    if rate_limit_state.remaining <= min_remaining:
+    if ctx.state.remaining <= ctx.min_remaining:
         now = int(time.time())
-        sleep_for = rate_limit_state.reset_epoch - now + 1
+        sleep_for = ctx.state.reset_epoch - now + 1
         if sleep_for > 0:
-            reset_human = datetime.fromtimestamp(rate_limit_state.reset_epoch).strftime("%Y-%m-%d %H:%M:%S")
+            reset_human = datetime.fromtimestamp(
+                ctx.state.reset_epoch, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
             print(
-                f"Core rate limit low (remaining={rate_limit_state.remaining}). "
+                f"Core rate limit low (remaining={ctx.state.remaining}). "
                 f"Sleeping ~{sleep_for}s until reset ({reset_human}).",
                 file=sys.stderr,
             )
             time.sleep(sleep_for)
 
 
-def gh_call(
-    args: list[str],
-    min_remaining: int,
-    check_every: int,
-    gh_hostname: str | None = None,
-) -> tuple[bool, str, str]:
+# ---------------------------------------------------------------------------
+# Subprocess wrapper
+# ---------------------------------------------------------------------------
+
+def _run_subprocess(args: list[str], env: dict[str, str]) -> tuple[bool, str, str]:
+    """Execute a subprocess. Returns (success, stdout, stderr). Handles timeout."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        return result.returncode == 0, result.stdout, result.stderr
+    except subprocess.TimeoutExpired as exc:
+        partial_stderr = ""
+        if exc.stderr:
+            raw = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(errors="replace")
+            partial_stderr = raw[:200]
+        print(f"Timeout ({SUBPROCESS_TIMEOUT}s) running: {' '.join(args)}", file=sys.stderr)
+        if partial_stderr:
+            print(f"Partial stderr: {partial_stderr}", file=sys.stderr)
+        return False, "", "timeout"
+
+
+def gh_call(args: list[str], ctx: GhContext) -> tuple[bool, str, str]:
     """
     Run a gh CLI command with proactive and reactive rate limit handling.
-    Injects GH_HOST into the subprocess environment if gh_hostname is provided,
-    so all calls target the correct GitHub instance without modifying the parent shell.
     Returns (success, stdout, stderr). Retries once after sleeping if rate limited.
     """
-    maybe_pause_for_rate_limit(min_remaining, check_every, gh_hostname)
+    maybe_pause_for_rate_limit(ctx)
 
-    env = build_gh_env(gh_hostname)
-
-    def run_command() -> tuple[bool, str, str]:
-        result = subprocess.run(args, capture_output=True, text=True, env=env)
-        return result.returncode == 0, result.stdout, result.stderr
-
-    success, stdout, stderr = run_command()
+    success, stdout, stderr = _run_subprocess(args, ctx.env)
 
     if success:
         return True, stdout, stderr
 
-    rate_limit_indicators = [
-        "rate limit", "secondary rate", "abuse detection", "HTTP 403", "API rate limit exceeded"
-    ]
-    combined_output = (stderr + stdout).lower()
-    is_rate_limited = any(indicator.lower() in combined_output for indicator in rate_limit_indicators)
+    combined = (stderr + stdout).lower()
+    is_rate_limited = any(pat in combined for pat in _RATE_LIMIT_PATTERNS)
 
     if is_rate_limited:
-        if query_rate_limit(gh_hostname):
+        if query_rate_limit(ctx):
             now = int(time.time())
-            sleep_for = rate_limit_state.reset_epoch - now + 1
+            sleep_for = ctx.state.reset_epoch - now + 1
             if sleep_for > 0:
-                print(f"Rate limited. Sleeping {sleep_for}s until reset, then retrying once...", file=sys.stderr)
+                print(
+                    f"Rate limited. Sleeping {sleep_for}s until reset, then retrying once...",
+                    file=sys.stderr,
+                )
                 time.sleep(sleep_for)
         else:
             print("Rate limited. Sleeping 30s (could not query reset)...", file=sys.stderr)
             time.sleep(30)
 
-        success, stdout, stderr = run_command()
+        success, stdout, stderr = _run_subprocess(args, ctx.env)
         if success:
             return True, stdout, stderr
 
@@ -143,101 +286,96 @@ def gh_call(
     return False, stdout, stderr
 
 
-def load_orgs_from_file(file_path: str) -> list[str]:
-    """
-    Parse an org list file. Returns a list of org names.
-    Skips blank lines and lines starting with #.
-    """
-    if not os.path.isfile(file_path):
-        print(f"Error: Org file not found: {file_path}", file=sys.stderr)
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# JSON helper
+# ---------------------------------------------------------------------------
 
-    orgs = []
-    with open(file_path) as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            orgs.append(line)
-
-    if not orgs:
-        print(f"Error: No org names found in '{file_path}' (all lines are blank or comments).", file=sys.stderr)
-        sys.exit(1)
-
-    return orgs
+def parse_json_safe(stdout: str, context: str) -> list | dict | None:
+    """Parse JSON from subprocess stdout. Returns None and logs on parse failure."""
+    stripped = stdout.strip()
+    if not stripped:
+        return []
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        print(f"Error: Failed to parse JSON ({context}): {exc}", file=sys.stderr)
+        return None
 
 
-def check_org_access(org: str, min_remaining: int, check_every: int, gh_hostname: str | None) -> bool:
+# ---------------------------------------------------------------------------
+# GitHub API calls
+# ---------------------------------------------------------------------------
+
+def check_org_access(org: str, ctx: GhContext) -> bool:
     """Returns True if the authenticated user can access the org."""
-    success, _, _ = gh_call(
-        ["gh", "api", f"orgs/{org}", "--silent"],
-        min_remaining, check_every, gh_hostname,
-    )
+    success, _, _ = gh_call(["gh", "api", f"orgs/{org}", "--silent"], ctx)
     return success
 
 
-def fetch_repos(
-    org: str, limit: int, min_remaining: int, check_every: int, gh_hostname: str | None
-) -> list[dict]:
+def _check_and_report(org: str, ctx: GhContext) -> bool:
+    """Check org access and print result inline."""
+    print(f"  Checking {org}...", end=" ", flush=True)
+    ok = check_org_access(org, ctx)
+    print("OK" if ok else "FAILED")
+    return ok
+
+
+def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
     """Fetch all repos for the org as a list of dicts."""
-    jq_query = (
-        "[.[] | {"
-        "nameWithOwner: .nameWithOwner, "
-        "hasIssuesEnabled: .hasIssuesEnabled, "
-        "primaryLanguage: (.primaryLanguage.name // \"N/A\"), "
-        "isArchived: .isArchived"
-        "}]"
-    )
     success, stdout, _ = gh_call(
-        ["gh", "repo", "list", org, "--limit", str(limit), "--json",
-         "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived", "--jq", jq_query],
-        min_remaining, check_every, gh_hostname,
+        [
+            "gh", "repo", "list", org,
+            "--limit", str(limit),
+            "--json", "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived",
+            "--jq", _REPO_JQ,
+        ],
+        ctx,
     )
     if not success:
         print(f"Error: Failed to fetch repos for org '{org}'.", file=sys.stderr)
         return []
-    return json.loads(stdout.strip()) if stdout.strip() else []
+    result = parse_json_safe(stdout, f"fetch_repos org={org}")
+    return result if isinstance(result, list) else []
 
 
-def find_open_issues(
-    repo: str, title: str, min_remaining: int, check_every: int, gh_hostname: str | None
-) -> list[int]:
-    """Return list of open issue numbers matching the given title."""
+def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
+    """Return open issue numbers matching title, or None if the API call failed.
+
+    Callers must distinguish None (call failed) from [] (no issues found):
+    - None   -> API call failed; treat as unknown, do not proceed
+    - []     -> no matching open issues exist
+    - [...]  -> matching issues were found
+    """
     success, stdout, _ = gh_call(
-        ["gh", "issue", "list", "--repo", repo, "--state", "open",
-         "--search", f"{title} in:title", "--json", "number", "--jq", "[.[].number]"],
-        min_remaining, check_every, gh_hostname,
+        [
+            "gh", "issue", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--search", f"{title} in:title",
+            "--json", "number",
+            "--jq", "[.[].number]",
+        ],
+        ctx,
     )
-    if not success or not stdout.strip():
-        return []
-    return json.loads(stdout.strip())
+    if not success:
+        return None
+    result = parse_json_safe(stdout, f"find_open_issues repo={repo}")
+    return result if isinstance(result, list) else None
 
 
-def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
-    """Print a visible header when processing multiple orgs."""
-    if total_orgs > 1:
-        print(f"\n{'#' * 64}")
-        print(f"# Organization {org_index}/{total_orgs}: {org}")
-        print(f"{'#' * 64}")
-
+# ---------------------------------------------------------------------------
+# Mode: delete
+# ---------------------------------------------------------------------------
 
 def run_delete_mode(
     org: str,
     repos: list[dict],
-    csv_writer: csv.DictWriter,
-    min_remaining: int,
-    check_every: int,
-    gh_hostname: str | None,
-) -> dict:
-    """
-    Close all open trigger issues across org repos.
-    Returns a stats dict for use in multi-org summaries.
-    """
-    print("================================================================")
-    print(f"DELETE MODE: Removing issues with title '{ISSUE_TITLE}'")
-    print("================================================================\n")
-
-    total_repos = archived_count = deleted_count = skipped_no_issues = failed_delete_count = 0
+    csv_writer: csv.DictWriter[str],
+    csv_file: io.TextIOWrapper,
+    ctx: GhContext,
+) -> OrgStats:
+    """Close all open trigger issues across org repos."""
+    stats = OrgStats(org=org)
 
     for repo in repos:
         name = repo["nameWithOwner"]
@@ -246,26 +384,38 @@ def run_delete_mode(
 
         print("-------------------------------------------")
         print(f"Processing {name}")
-        total_repos += 1
+        stats.total_repos += 1
 
         if is_archived:
-            archived_count += 1
+            stats.archived += 1
             print("Repository is archived. Skipping.")
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "is_archived": is_archived, "issues_deleted": 0, "action": "skipped_archived",
             })
+            csv_file.flush()
             continue
 
-        issue_numbers = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every, gh_hostname)
+        issue_numbers = find_open_issues(name, ISSUE_TITLE, ctx)
+
+        if issue_numbers is None:
+            print("Could not query issues (API error). Skipping.")
+            stats.failed += 1
+            csv_writer.writerow({
+                "org": org, "repo": name, "primary_language": primary_lang,
+                "is_archived": is_archived, "issues_deleted": 0, "action": "failed_query_issues",
+            })
+            csv_file.flush()
+            continue
 
         if not issue_numbers:
             print("No matching issues found.")
-            skipped_no_issues += 1
+            stats.skipped_no_issues += 1
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "is_archived": is_archived, "issues_deleted": 0, "action": "no_issues_found",
             })
+            csv_file.flush()
             continue
 
         issues_deleted = issues_failed = 0
@@ -275,56 +425,49 @@ def run_delete_mode(
             success, _, _ = gh_call(
                 ["gh", "issue", "close", str(issue_num), "--repo", name,
                  "--comment", "Closed by cleanup script"],
-                min_remaining, check_every, gh_hostname,
+                ctx,
             )
             if success:
                 issues_deleted += 1
-                deleted_count += 1
+                stats.deleted += 1
             else:
                 print(f"Failed to close issue #{issue_num}")
                 issues_failed += 1
-                failed_delete_count += 1
+                stats.failed += 1
 
         action = "partial_delete" if issues_failed > 0 else "deleted"
         csv_writer.writerow({
             "org": org, "repo": name, "primary_language": primary_lang,
             "is_archived": is_archived, "issues_deleted": issues_deleted, "action": action,
         })
+        csv_file.flush()
 
     print(f"\nFinished closing issues for org: {org}\n")
     print(f"Delete Stats for Organization: {org}")
     print("----------------------------------------------------------------")
-    print(f"Total Repositories:            {total_repos}")
-    print(f"Archived Repositories:         {archived_count}")
-    print(f"Repositories with No Issues:   {skipped_no_issues}")
-    print(f"Issues Closed:                 {deleted_count}")
-    print(f"Failed Closes:                 {failed_delete_count}")
+    print(f"Total Repositories:            {stats.total_repos}")
+    print(f"Archived Repositories:         {stats.archived}")
+    print(f"Repositories with No Issues:   {stats.skipped_no_issues}")
+    print(f"Issues Closed:                 {stats.deleted}")
+    print(f"Failed Closes:                 {stats.failed}")
     print("----------------------------------------------------------------")
 
-    return {
-        "org": org,
-        "total_repos": total_repos,
-        "archived": archived_count,
-        "skipped_no_issues": skipped_no_issues,
-        "deleted": deleted_count,
-        "failed": failed_delete_count,
-    }
+    return stats
 
+
+# ---------------------------------------------------------------------------
+# Mode: create
+# ---------------------------------------------------------------------------
 
 def run_create_mode(
     org: str,
     repos: list[dict],
-    csv_writer: csv.DictWriter,
-    min_remaining: int,
-    check_every: int,
-    gh_hostname: str | None,
-) -> dict:
-    """
-    Create baseline scan trigger issues across org repos.
-    Returns a stats dict for use in multi-org summaries.
-    """
-    total_count = iac_count = archived_count = created_count = 0
-    skipped_existing_count = skipped_archived_count = skipped_issues_perm_count = failed_count = 0
+    csv_writer: csv.DictWriter[str],
+    csv_file: io.TextIOWrapper,
+    ctx: GhContext,
+) -> OrgStats:
+    """Create baseline scan trigger issues across org repos."""
+    stats = OrgStats(org=org)
 
     for repo in repos:
         name = repo["nameWithOwner"]
@@ -334,139 +477,183 @@ def run_create_mode(
 
         print("-------------------------------------------")
         print(f"Processing {name}")
-        total_count += 1
-
-        if primary_lang in IAC_LANGUAGES:
-            iac_count += 1
+        stats.total_repos += 1
 
         if is_archived:
-            archived_count += 1
-            skipped_archived_count += 1
+            stats.archived += 1
             print("Repository is archived. Skipping.")
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
-                "issues_enabled": issues_enabled, "is_archived": is_archived, "action": "skipped_archived",
+                "issues_enabled": issues_enabled, "is_archived": is_archived,
+                "action": "skipped_archived",
             })
+            csv_file.flush()
             continue
+
+        # IaC count after archived guard: archived IaC repos are not included
+        if primary_lang in IAC_LANGUAGES:
+            stats.iac += 1
 
         was_disabled = False
         if not issues_enabled:
             print("Issues are disabled. Temporarily enabling...")
             success, _, _ = gh_call(
-                ["gh", "repo", "edit", name, "--enable-issues"],
-                min_remaining, check_every, gh_hostname,
+                ["gh", "repo", "edit", name, "--enable-issues"], ctx
             )
             if not success:
                 print("Could not enable issues. Skipping issue creation.")
-                skipped_issues_perm_count += 1
+                stats.skipped_perm += 1
                 csv_writer.writerow({
                     "org": org, "repo": name, "primary_language": primary_lang,
                     "issues_enabled": issues_enabled, "is_archived": is_archived,
                     "action": "skipped_cant_enable_issues",
                 })
+                csv_file.flush()
                 continue
             was_disabled = True
 
-        existing_issues = find_open_issues(name, ISSUE_TITLE, min_remaining, check_every, gh_hostname)
+        existing_issues = find_open_issues(name, ISSUE_TITLE, ctx)
+
+        if existing_issues is None:
+            print("Could not query existing issues (API error). Skipping to avoid duplicates.")
+            stats.failed += 1
+            if was_disabled:
+                print("Restoring state: Disabling issues...")
+                gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
+            csv_writer.writerow({
+                "org": org, "repo": name, "primary_language": primary_lang,
+                "issues_enabled": issues_enabled, "is_archived": is_archived,
+                "action": "failed_query_issues",
+            })
+            csv_file.flush()
+            continue
 
         if existing_issues:
             print("Open issue with same title already exists. Skipping.")
-            skipped_existing_count += 1
+            stats.skipped_existing += 1
             if was_disabled:
                 print("Restoring state: Disabling issues...")
-                gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every, gh_hostname)
+                gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "issues_enabled": issues_enabled, "is_archived": is_archived,
                 "action": "skipped_existing_issue",
             })
+            csv_file.flush()
             continue
 
         print("Creating issue...")
         success, _, _ = gh_call(
             ["gh", "issue", "create", "--repo", name, "--title", ISSUE_TITLE, "--body", ISSUE_BODY],
-            min_remaining, check_every, gh_hostname,
+            ctx,
         )
 
         if success:
-            created_count += 1
+            stats.created += 1
             action = "created"
         else:
             print("Failed to create issue.")
-            failed_count += 1
+            stats.failed += 1
             action = "failed_create"
 
         if was_disabled:
             print("Restoring state: Disabling issues...")
-            gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], min_remaining, check_every, gh_hostname)
+            gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
 
         csv_writer.writerow({
             "org": org, "repo": name, "primary_language": primary_lang,
             "issues_enabled": issues_enabled, "is_archived": is_archived, "action": action,
         })
+        csv_file.flush()
 
     print(f"\nFinished processing all repositories for org: {org}\n")
     print(f"Repository Stats for Organization: {org}")
     print("----------------------------------------------------------------")
-    print(f"Total Repositories:       {total_count}")
-    print(f"Archived Repositories:    {archived_count}")
-    print(f"Skipped Archived:         {skipped_archived_count}")
-    print(f"IaC Repositories:         {iac_count} (Primary language: HCL/Bicep)")
-    print(f"Issues Permission Skips:  {skipped_issues_perm_count}")
-    print(f"Skipped Existing Issues:  {skipped_existing_count}")
-    print(f"Created Issues:           {created_count}")
-    print(f"Failed Creates:           {failed_count}")
+    print(f"Total Repositories:       {stats.total_repos}")
+    print(f"Archived Repositories:    {stats.archived}")
+    print(f"IaC Repositories:         {stats.iac} (Primary language: HCL/Bicep)")
+    print(f"Issues Permission Skips:  {stats.skipped_perm}")
+    print(f"Skipped Existing Issues:  {stats.skipped_existing}")
+    print(f"Created Issues:           {stats.created}")
+    print(f"Failed Creates:           {stats.failed}")
     print("----------------------------------------------------------------")
 
-    return {
-        "org": org,
-        "total_repos": total_count,
-        "archived": archived_count,
-        "iac": iac_count,
-        "skipped_perm": skipped_issues_perm_count,
-        "skipped_existing": skipped_existing_count,
-        "created": created_count,
-        "failed": failed_count,
-    }
+    return stats
 
 
-def print_multi_org_summary(all_stats: list[dict], delete_mode: bool) -> None:
-    """Print a rolled-up summary across all orgs when running in multi-org mode."""
+# ---------------------------------------------------------------------------
+# Summary + header
+# ---------------------------------------------------------------------------
+
+def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
+    """Print a visible org header in multi-org mode."""
+    if total_orgs > 1:
+        print(f"\n{'#' * 64}")
+        print(f"# Organization {org_index}/{total_orgs}: {org}")
+        print(f"{'#' * 64}")
+
+
+def print_multi_org_summary(
+    all_stats: list[OrgStats],
+    delete_mode: bool,
+    output_file: str,
+) -> None:
+    """Print a rolled-up summary across all orgs."""
     print(f"\n{'=' * 64}")
     print("MULTI-ORG SUMMARY")
     print(f"{'=' * 64}")
 
     if delete_mode:
-        total_repos = sum(s["total_repos"] for s in all_stats)
-        total_deleted = sum(s["deleted"] for s in all_stats)
-        total_failed = sum(s["failed"] for s in all_stats)
-        total_archived = sum(s["archived"] for s in all_stats)
-        total_no_issues = sum(s["skipped_no_issues"] for s in all_stats)
+        total_repos     = sum(s.total_repos        for s in all_stats)
+        total_deleted   = sum(s.deleted            for s in all_stats)
+        total_failed    = sum(s.failed             for s in all_stats)
+        total_archived  = sum(s.archived           for s in all_stats)
+        total_no_issues = sum(s.skipped_no_issues  for s in all_stats)
 
         print(f"{'Org':<30} {'Repos':>6} {'Closed':>8} {'Failed':>8} {'Archived':>9} {'No Issues':>10}")
         print("-" * 75)
         for s in all_stats:
-            print(f"{s['org']:<30} {s['total_repos']:>6} {s['deleted']:>8} {s['failed']:>8} {s['archived']:>9} {s['skipped_no_issues']:>10}")
+            print(
+                f"{s.org:<30} {s.total_repos:>6} {s.deleted:>8} {s.failed:>8} "
+                f"{s.archived:>9} {s.skipped_no_issues:>10}"
+            )
         print("-" * 75)
-        print(f"{'TOTAL':<30} {total_repos:>6} {total_deleted:>8} {total_failed:>8} {total_archived:>9} {total_no_issues:>10}")
+        print(
+            f"{'TOTAL':<30} {total_repos:>6} {total_deleted:>8} {total_failed:>8} "
+            f"{total_archived:>9} {total_no_issues:>10}"
+        )
     else:
-        total_repos = sum(s["total_repos"] for s in all_stats)
-        total_created = sum(s["created"] for s in all_stats)
-        total_failed = sum(s["failed"] for s in all_stats)
-        total_archived = sum(s["archived"] for s in all_stats)
-        total_skipped = sum(s["skipped_existing"] for s in all_stats)
-        total_perm = sum(s["skipped_perm"] for s in all_stats)
-        total_iac = sum(s["iac"] for s in all_stats)
+        total_repos    = sum(s.total_repos      for s in all_stats)
+        total_created  = sum(s.created          for s in all_stats)
+        total_failed   = sum(s.failed           for s in all_stats)
+        total_archived = sum(s.archived         for s in all_stats)
+        total_skipped  = sum(s.skipped_existing for s in all_stats)
+        total_perm     = sum(s.skipped_perm     for s in all_stats)
+        total_iac      = sum(s.iac              for s in all_stats)
 
-        print(f"{'Org':<30} {'Repos':>6} {'Created':>8} {'Failed':>8} {'Archived':>9} {'Skipped':>8} {'PermSkip':>9} {'IaC':>5}")
+        print(
+            f"{'Org':<30} {'Repos':>6} {'Created':>8} {'Failed':>8} "
+            f"{'Archived':>9} {'Skipped':>8} {'PermSkip':>9} {'IaC':>5}"
+        )
         print("-" * 90)
         for s in all_stats:
-            print(f"{s['org']:<30} {s['total_repos']:>6} {s['created']:>8} {s['failed']:>8} {s['archived']:>9} {s['skipped_existing']:>8} {s['skipped_perm']:>9} {s['iac']:>5}")
+            print(
+                f"{s.org:<30} {s.total_repos:>6} {s.created:>8} {s.failed:>8} "
+                f"{s.archived:>9} {s.skipped_existing:>8} {s.skipped_perm:>9} {s.iac:>5}"
+            )
         print("-" * 90)
-        print(f"{'TOTAL':<30} {total_repos:>6} {total_created:>8} {total_failed:>8} {total_archived:>9} {total_skipped:>8} {total_perm:>9} {total_iac:>5}")
+        print(
+            f"{'TOTAL':<30} {total_repos:>6} {total_created:>8} {total_failed:>8} "
+            f"{total_archived:>9} {total_skipped:>8} {total_perm:>9} {total_iac:>5}"
+        )
 
-    print(f"\nCSV Output: {OUTPUT_FILE}")
+    print(f"\nCSV Output: {output_file}")
     print(f"{'=' * 64}")
+
+
+# ---------------------------------------------------------------------------
+# Main function
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -479,8 +666,10 @@ def main() -> None:
 
     org_group = parser.add_mutually_exclusive_group(required=True)
     org_group.add_argument("org", nargs="?", help="Single GitHub organization name")
-    org_group.add_argument("--org-file", metavar="FILE",
-                           help="Path to a text file with one org name per line (# lines are comments)")
+    org_group.add_argument(
+        "--org-file", metavar="FILE",
+        help="Path to a text file with one org name per line (# lines are comments)",
+    )
 
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
     parser.add_argument(
@@ -493,22 +682,39 @@ def main() -> None:
             "Ensure GH_ENTERPRISE_TOKEN (GHES) or GH_TOKEN (GHEC/github.com) is set before running."
         ),
     )
-    parser.add_argument("--repo-limit", type=int, default=DEFAULT_REPO_LIST_LIMIT,
-                        help=f"Max repos to fetch per org (default: {DEFAULT_REPO_LIST_LIMIT})")
-    parser.add_argument("--min-remaining", type=int, default=DEFAULT_RL_MIN_REMAINING,
-                        help=f"Pause when core API remaining <= N (default: {DEFAULT_RL_MIN_REMAINING})")
-    parser.add_argument("--rl-check-every", type=int, default=DEFAULT_RL_CHECK_EVERY,
-                        help=f"Check rate limit every N gh calls (default: {DEFAULT_RL_CHECK_EVERY})")
+    parser.add_argument(
+        "--output", metavar="FILE", default=DEFAULT_OUTPUT_FILE,
+        help=f"Output CSV file path (default: {DEFAULT_OUTPUT_FILE})",
+    )
+    parser.add_argument(
+        "--repo-limit", type=int, default=DEFAULT_REPO_LIST_LIMIT,
+        help=f"Max repos to fetch per org (default: {DEFAULT_REPO_LIST_LIMIT})",
+    )
+    parser.add_argument(
+        "--min-remaining", type=int, default=DEFAULT_RL_MIN_REMAINING,
+        help=f"Pause when core API remaining <= N (default: {DEFAULT_RL_MIN_REMAINING})",
+    )
+    parser.add_argument(
+        "--rl-check-every", type=int, default=DEFAULT_RL_CHECK_EVERY,
+        help=f"Check rate limit every N gh calls (default: {DEFAULT_RL_CHECK_EVERY})",
+    )
     args = parser.parse_args()
 
-    # Validate gh CLI is available
+    # --- CLI argument validation ---
+    if args.rl_check_every < 1:
+        print("Error: --rl-check-every must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.min_remaining < 0:
+        print("Error: --min-remaining must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
     if shutil.which("gh") is None:
         print("Error: GitHub CLI (gh) is not installed.", file=sys.stderr)
         sys.exit(1)
 
     gh_hostname = args.hostname
 
-    # Warn if targeting GHES without GH_ENTERPRISE_TOKEN set
     if gh_hostname and "ghe.com" not in gh_hostname and not os.environ.get("GH_ENTERPRISE_TOKEN"):
         print(
             f"Warning: --hostname is set to '{gh_hostname}' but GH_ENTERPRISE_TOKEN is not set. "
@@ -519,63 +725,87 @@ def main() -> None:
     if gh_hostname:
         print(f"Targeting GitHub host: {gh_hostname}")
 
-    # Resolve org list
+    ctx = GhContext(
+        env=build_gh_env(gh_hostname),
+        state=RateLimitState(),
+        min_remaining=args.min_remaining,
+        check_every=args.rl_check_every,
+    )
+
+    # --- Resolve org list ---
     if args.org_file:
-        orgs = load_orgs_from_file(args.org_file)
+        try:
+            orgs = load_orgs_from_file(args.org_file)
+        except OrgFileError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Loaded {len(orgs)} org(s) from '{args.org_file}'.")
     else:
+        if not validate_org_name(args.org):
+            print(f"Error: Invalid org name: {args.org!r}", file=sys.stderr)
+            sys.exit(1)
         orgs = [args.org]
 
     total_orgs = len(orgs)
-    multi_org_mode = total_orgs > 1
 
-    # Pre-flight: validate access to all orgs before starting work
+    # --- Pre-flight access check ---
     print("\nChecking access to all organizations...")
-    inaccessible_orgs = []
-    for org in orgs:
-        print(f"  Checking {org}...", end=" ")
-        if check_org_access(org, args.min_remaining, args.rl_check_every, gh_hostname):
-            print("OK")
-        else:
-            print("FAILED")
-            inaccessible_orgs.append(org)
+    inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx)]
 
     if inaccessible_orgs:
-        print(f"\nError: Cannot access the following org(s): {', '.join(inaccessible_orgs)}", file=sys.stderr)
+        print(
+            f"\nError: Cannot access the following org(s): {', '.join(inaccessible_orgs)}",
+            file=sys.stderr,
+        )
         print("Aborting. Fix access or remove them from the org file and retry.", file=sys.stderr)
         sys.exit(1)
 
     print()
 
     if args.delete:
+        print("================================================================")
+        print(f"DELETE MODE: Removing issues with title '{ISSUE_TITLE}'")
+        print("================================================================\n")
         fieldnames = ["org", "repo", "primary_language", "is_archived", "issues_deleted", "action"]
     else:
         fieldnames = ["org", "repo", "primary_language", "issues_enabled", "is_archived", "action"]
 
-    all_stats = []
+    output_file = args.output
+    all_stats: list[OrgStats] = []
 
-    with open(OUTPUT_FILE, "w", newline="") as csv_file:
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        csv_writer.writeheader()
+    if os.path.exists(output_file):
+        print(f"Warning: '{output_file}' already exists and will be overwritten.", file=sys.stderr)
 
-        for org_index, org in enumerate(orgs, start=1):
-            print_org_header(org, org_index, total_orgs)
+    try:
+        with open(output_file, "w", newline="") as csv_file:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_file.flush()
 
-            repos = fetch_repos(org, args.repo_limit, args.min_remaining, args.rl_check_every, gh_hostname)
-            if not repos:
-                continue
+            for org_index, org in enumerate(orgs, start=1):
+                print_org_header(org, org_index, total_orgs)
 
-            if args.delete:
-                stats = run_delete_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every, gh_hostname)
-            else:
-                stats = run_create_mode(org, repos, csv_writer, args.min_remaining, args.rl_check_every, gh_hostname)
+                repos = fetch_repos(org, args.repo_limit, ctx)
+                if not repos:
+                    print(f"  No repos returned for '{org}' — skipping.", file=sys.stderr)
+                    all_stats.append(OrgStats(org=org))
+                    continue
 
-            all_stats.append(stats)
+                if args.delete:
+                    stats = run_delete_mode(org, repos, csv_writer, csv_file, ctx)
+                else:
+                    stats = run_create_mode(org, repos, csv_writer, csv_file, ctx)
 
-    if multi_org_mode and all_stats:
-        print_multi_org_summary(all_stats, args.delete)
+                all_stats.append(stats)
 
-    print(f"\nCSV Output: {OUTPUT_FILE}")
+    except KeyboardInterrupt:
+        print("\nInterrupted. Partial CSV output may exist.", file=sys.stderr)
+        sys.exit(130)
+
+    if total_orgs > 1 and all_stats:
+        print_multi_org_summary(all_stats, args.delete, output_file)
+
+    print(f"\nCSV Output: {output_file}")
 
 
 if __name__ == "__main__":

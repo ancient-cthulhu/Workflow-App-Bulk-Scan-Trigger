@@ -1,6 +1,6 @@
 # Veracode Workflow App - Issue Scan Trigger Script
 
-Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, and multi-org runs with a CSV audit trail.
+Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, stale scan detection, and multi-org runs with a CSV audit trail.
 
 ---
 
@@ -9,11 +9,12 @@ Creates or closes GitHub issues across repositories in one or more GitHub organi
 For each repository in the target organization, the script:
 
 1. Skips archived repositories
-2. Temporarily enables Issues if disabled (restores original state after)
-3. Checks for an existing open trigger issue to avoid duplicates
-4. Creates the trigger issue
-5. Writes a per-repo result row to the CSV audit trail
-6. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
+2. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
+3. Temporarily enables Issues if disabled (restores original state after)
+4. Checks for an existing open trigger issue to avoid duplicates
+5. Creates the trigger issue
+6. Writes a per-repo result row to the CSV audit trail
+7. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
 
 > **Scans are not triggered directly.** The issue acts as a signal to the Veracode Workflow App, which initiates scans based on the `veracode.yml` configuration in each repository. If `issues.trigger` is not set to `true` in `veracode.yml`, no scan will start.
 
@@ -31,6 +32,13 @@ python script.py my-github-org
 
 ```bash
 python script.py --org-file orgs.txt
+```
+
+### Only trigger repos not scanned in the last 30 days
+
+```bash
+python script.py --stale-days 30 my-github-org
+python script.py --stale-days 30 --org-file orgs.txt
 ```
 
 ### Clean up trigger issues
@@ -107,13 +115,35 @@ The command value must exactly match the Workflow App command name. This mismatc
 | `org` | Single org name (positional argument) |
 | `--org-file FILE` | Path to a text file with one org per line. `#` lines and blank lines are ignored. Mutually exclusive with the positional org argument. |
 | `--delete` | Close previously created trigger issues instead of creating new ones |
+| `--stale-days N` | Only create issues for repos not scanned in the last N days. Checks for Veracode check runs (SAST, SCA, IaC). Disabled by default. Set to 0 to disable. Ignored in delete mode. |
 | `--hostname HOSTNAME` | GitHub hostname. Omit for github.com. GHES: `github.mycompany.com`. GHEC: `myorg.ghe.com`. Sets `GH_HOST` per-call without modifying your shell. |
 | `--output FILE` | CSV output path (default: `vcbaseline.csv`) |
 | `--repo-limit N` | Max repos to fetch per org (default: `1000`) |
-| `--min-remaining N` | Pause when Core API remaining ≤ N (default: `100`) |
+| `--min-remaining N` | Pause when Core API remaining <= N (default: `100`) |
 | `--rl-check-every N` | Check rate limit every N gh calls (default: `50`) |
 
 Environment variables `GH_RL_MIN_REMAINING`, `GH_RL_CHECK_EVERY`, and `REPO_LIST_LIMIT` set the same defaults as their flag equivalents. Flags take precedence.
+
+---
+
+## Stale Scan Detection
+
+Use `--stale-days N` to only create trigger issues for repositories that have not had a Veracode scan in the last N days. This is useful for periodic re-scans or ensuring coverage across large orgs.
+
+The script queries GitHub check runs on each repo and looks for checks starting with "Veracode" (matching SAST, SCA, and IaC scans). If the most recent check is within the threshold, the repo is skipped.
+
+```bash
+# Trigger scans only for repos not scanned in 30 days
+python script.py --stale-days 30 my-github-org
+
+# 14-day threshold
+python script.py --stale-days 14 --org-file orgs.txt
+
+# Disable stale check (default behavior)
+python script.py --stale-days 0 my-github-org
+```
+
+Repos with no Veracode check history are treated as stale and will have issues created.
 
 ---
 
@@ -160,6 +190,8 @@ python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --or
 
 Rate limit pauses are logged to stderr so the CSV output stays clean.
 
+> **Note:** When using `--stale-days`, the script makes an additional API call per repo to query check runs. For very large orgs, this increases API usage. Adjust `--min-remaining` and `--rl-check-every` accordingly.
+
 ---
 
 ## Output
@@ -175,11 +207,14 @@ Rate limit pauses are logged to stderr so the CSV output stays clean.
 | `primary_language` | Repository primary language, or `N/A` |
 | `issues_enabled` | Whether Issues were enabled before the run |
 | `is_archived` | Whether the repository is archived |
+| `last_check_date` | Timestamp of most recent Veracode check run (empty if none found or `--stale-days` not used) |
+| `days_since_check` | Days since the last Veracode check (empty if none found or `--stale-days` not used) |
 | `action` | Outcome - see values below |
 
 | `action` value | Meaning |
 |----------------|---------|
 | `created` | Issue created successfully |
+| `skipped_recent_check` | Veracode check found within `--stale-days` threshold |
 | `skipped_existing_issue` | Open trigger issue already exists |
 | `skipped_archived` | Repository is archived, skipped |
 | `skipped_cant_enable_issues` | Issues could not be enabled (insufficient permissions) |
@@ -247,6 +282,9 @@ To re-trigger scans:
 
 - **GHEC: targeting the wrong GitHub instance**
   - Use `--hostname myorg.ghe.com` to force the correct host. GHEC uses `GH_TOKEN`, not `GH_ENTERPRISE_TOKEN`.
+
+- **Stale check not finding Veracode runs**
+  - Verify that Veracode check runs appear on commits/PRs in the repo. The script looks for check names starting with "Veracode". If your Workflow App uses different naming, update the filter in `get_last_veracode_check()`.
 
 ---
 

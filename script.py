@@ -3,6 +3,7 @@
 script.py - Create or close Veracode baseline scan trigger issues across all repos in a GitHub org.
 Supports a single org (positional arg) or multiple orgs via --org-file.
 Supports GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES) via --hostname.
+Supports --stale-days to only create issues for repos not scanned within N days.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ ISSUE_BODY = "Veracode All Scans"
 IAC_LANGUAGES = frozenset({"HCL", "Bicep"})
 SUBPROCESS_TIMEOUT = 60
 DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
+DEFAULT_STALE_DAYS = 30
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,38}$")
 
@@ -115,6 +117,7 @@ class OrgStats:
     iac: int = 0
     skipped_perm: int = 0
     skipped_existing: int = 0
+    skipped_recent: int = 0
     created: int = 0
     # delete mode
     skipped_no_issues: int = 0
@@ -201,7 +204,7 @@ def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
     """Proactively pause if remaining API calls are low."""
     ctx.state.call_count += 1
 
-    # Check on the first call and then every N calls thereafter
+    # Check on the first call and then every N calls
     if ctx.state.call_count != 1 and ctx.state.call_count % ctx.check_every != 0:
         return
 
@@ -363,6 +366,48 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
     return result if isinstance(result, list) else None
 
 
+def get_last_veracode_check(repo: str, ctx: GhContext) -> datetime | None:
+    """Return the most recent Veracode check run completion time, or None if not found."""
+    # Get default branch first
+    success, stdout, _ = gh_call(
+        ["gh", "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        ctx,
+    )
+    if not success or not stdout.strip():
+        return None
+    branch = stdout.strip()
+
+    # Query check runs on the default branch head
+    success, stdout, _ = gh_call(
+        [
+            "gh", "api", f"repos/{repo}/commits/{branch}/check-runs",
+            "--jq",
+            '[.check_runs[] | select(.name | startswith("Veracode")) | .completed_at] | map(select(. != null)) | max',
+        ],
+        ctx,
+    )
+    if not success:
+        return None
+
+    stripped = stdout.strip()
+    if not stripped or stripped == "null":
+        return None
+
+    try:
+        return datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def calculate_days_since(dt: datetime | None) -> int | None:
+    """Return number of days since the given datetime, or None if dt is None."""
+    if dt is None:
+        return None
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    return delta.days
+
+
 # ---------------------------------------------------------------------------
 # Mode: delete
 # ---------------------------------------------------------------------------
@@ -465,9 +510,11 @@ def run_create_mode(
     csv_writer: csv.DictWriter[str],
     csv_file: io.TextIOWrapper,
     ctx: GhContext,
+    stale_days: int | None,
 ) -> OrgStats:
     """Create baseline scan trigger issues across org repos."""
     stats = OrgStats(org=org)
+    check_stale = stale_days is not None and stale_days > 0
 
     for repo in repos:
         name = repo["nameWithOwner"]
@@ -479,12 +526,17 @@ def run_create_mode(
         print(f"Processing {name}")
         stats.total_repos += 1
 
+        # Initialize stale check fields
+        last_check_date: str = ""
+        days_since_check: str = ""
+
         if is_archived:
             stats.archived += 1
             print("Repository is archived. Skipping.")
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "issues_enabled": issues_enabled, "is_archived": is_archived,
+                "last_check_date": last_check_date, "days_since_check": days_since_check,
                 "action": "skipped_archived",
             })
             csv_file.flush()
@@ -493,6 +545,34 @@ def run_create_mode(
         # IaC count after archived guard: archived IaC repos are not included
         if primary_lang in IAC_LANGUAGES:
             stats.iac += 1
+
+        # Check for recent Veracode scans if --stale-days is set
+        if check_stale:
+            print(f"Checking for Veracode checks in the last {stale_days} days...")
+            last_check = get_last_veracode_check(name, ctx)
+            days_since = calculate_days_since(last_check)
+
+            if last_check:
+                last_check_date = last_check.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if days_since is not None:
+                days_since_check = str(days_since)
+
+            if last_check and days_since is not None and days_since < stale_days:
+                print(f"Recent Veracode check found ({days_since} days ago). Skipping.")
+                stats.skipped_recent += 1
+                csv_writer.writerow({
+                    "org": org, "repo": name, "primary_language": primary_lang,
+                    "issues_enabled": issues_enabled, "is_archived": is_archived,
+                    "last_check_date": last_check_date, "days_since_check": days_since_check,
+                    "action": "skipped_recent_check",
+                })
+                csv_file.flush()
+                continue
+
+            if last_check:
+                print(f"Last Veracode check was {days_since} days ago. Proceeding.")
+            else:
+                print("No Veracode checks found. Proceeding.")
 
         was_disabled = False
         if not issues_enabled:
@@ -506,6 +586,7 @@ def run_create_mode(
                 csv_writer.writerow({
                     "org": org, "repo": name, "primary_language": primary_lang,
                     "issues_enabled": issues_enabled, "is_archived": is_archived,
+                    "last_check_date": last_check_date, "days_since_check": days_since_check,
                     "action": "skipped_cant_enable_issues",
                 })
                 csv_file.flush()
@@ -523,6 +604,7 @@ def run_create_mode(
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "issues_enabled": issues_enabled, "is_archived": is_archived,
+                "last_check_date": last_check_date, "days_since_check": days_since_check,
                 "action": "failed_query_issues",
             })
             csv_file.flush()
@@ -537,6 +619,7 @@ def run_create_mode(
             csv_writer.writerow({
                 "org": org, "repo": name, "primary_language": primary_lang,
                 "issues_enabled": issues_enabled, "is_archived": is_archived,
+                "last_check_date": last_check_date, "days_since_check": days_since_check,
                 "action": "skipped_existing_issue",
             })
             csv_file.flush()
@@ -562,7 +645,9 @@ def run_create_mode(
 
         csv_writer.writerow({
             "org": org, "repo": name, "primary_language": primary_lang,
-            "issues_enabled": issues_enabled, "is_archived": is_archived, "action": action,
+            "issues_enabled": issues_enabled, "is_archived": is_archived,
+            "last_check_date": last_check_date, "days_since_check": days_since_check,
+            "action": action,
         })
         csv_file.flush()
 
@@ -574,6 +659,8 @@ def run_create_mode(
     print(f"IaC Repositories:         {stats.iac} (Primary language: HCL/Bicep)")
     print(f"Issues Permission Skips:  {stats.skipped_perm}")
     print(f"Skipped Existing Issues:  {stats.skipped_existing}")
+    if stale_days:
+        print(f"Skipped Recent Checks:    {stats.skipped_recent} (scanned within {stale_days} days)")
     print(f"Created Issues:           {stats.created}")
     print(f"Failed Creates:           {stats.failed}")
     print("----------------------------------------------------------------")
@@ -596,6 +683,7 @@ def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
 def print_multi_org_summary(
     all_stats: list[OrgStats],
     delete_mode: bool,
+    stale_days: int | None,
     output_file: str,
 ) -> None:
     """Print a rolled-up summary across all orgs."""
@@ -623,29 +711,47 @@ def print_multi_org_summary(
             f"{total_archived:>9} {total_no_issues:>10}"
         )
     else:
-        total_repos    = sum(s.total_repos      for s in all_stats)
-        total_created  = sum(s.created          for s in all_stats)
-        total_failed   = sum(s.failed           for s in all_stats)
-        total_archived = sum(s.archived         for s in all_stats)
-        total_skipped  = sum(s.skipped_existing for s in all_stats)
-        total_perm     = sum(s.skipped_perm     for s in all_stats)
-        total_iac      = sum(s.iac              for s in all_stats)
+        total_repos    = sum(s.total_repos       for s in all_stats)
+        total_created  = sum(s.created           for s in all_stats)
+        total_failed   = sum(s.failed            for s in all_stats)
+        total_archived = sum(s.archived          for s in all_stats)
+        total_skipped  = sum(s.skipped_existing  for s in all_stats)
+        total_perm     = sum(s.skipped_perm      for s in all_stats)
+        total_iac      = sum(s.iac               for s in all_stats)
+        total_recent   = sum(s.skipped_recent    for s in all_stats)
 
-        print(
-            f"{'Org':<30} {'Repos':>6} {'Created':>8} {'Failed':>8} "
-            f"{'Archived':>9} {'Skipped':>8} {'PermSkip':>9} {'IaC':>5}"
-        )
-        print("-" * 90)
-        for s in all_stats:
+        if stale_days:
             print(
-                f"{s.org:<30} {s.total_repos:>6} {s.created:>8} {s.failed:>8} "
-                f"{s.archived:>9} {s.skipped_existing:>8} {s.skipped_perm:>9} {s.iac:>5}"
+                f"{'Org':<30} {'Repos':>6} {'Created':>8} {'Failed':>8} "
+                f"{'Archived':>9} {'Skipped':>8} {'PermSkip':>9} {'Recent':>7} {'IaC':>5}"
             )
-        print("-" * 90)
-        print(
-            f"{'TOTAL':<30} {total_repos:>6} {total_created:>8} {total_failed:>8} "
-            f"{total_archived:>9} {total_skipped:>8} {total_perm:>9} {total_iac:>5}"
-        )
+            print("-" * 97)
+            for s in all_stats:
+                print(
+                    f"{s.org:<30} {s.total_repos:>6} {s.created:>8} {s.failed:>8} "
+                    f"{s.archived:>9} {s.skipped_existing:>8} {s.skipped_perm:>9} {s.skipped_recent:>7} {s.iac:>5}"
+                )
+            print("-" * 97)
+            print(
+                f"{'TOTAL':<30} {total_repos:>6} {total_created:>8} {total_failed:>8} "
+                f"{total_archived:>9} {total_skipped:>8} {total_perm:>9} {total_recent:>7} {total_iac:>5}"
+            )
+        else:
+            print(
+                f"{'Org':<30} {'Repos':>6} {'Created':>8} {'Failed':>8} "
+                f"{'Archived':>9} {'Skipped':>8} {'PermSkip':>9} {'IaC':>5}"
+            )
+            print("-" * 90)
+            for s in all_stats:
+                print(
+                    f"{s.org:<30} {s.total_repos:>6} {s.created:>8} {s.failed:>8} "
+                    f"{s.archived:>9} {s.skipped_existing:>8} {s.skipped_perm:>9} {s.iac:>5}"
+                )
+            print("-" * 90)
+            print(
+                f"{'TOTAL':<30} {total_repos:>6} {total_created:>8} {total_failed:>8} "
+                f"{total_archived:>9} {total_skipped:>8} {total_perm:>9} {total_iac:>5}"
+            )
 
     print(f"\nCSV Output: {output_file}")
     print(f"{'=' * 64}")
@@ -672,6 +778,15 @@ def main() -> None:
     )
 
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
+    parser.add_argument(
+        "--stale-days", type=int, metavar="N", default=None,
+        help=(
+            f"Only create issues for repos not scanned in the last N days. "
+            f"Checks for Veracode check runs (SAST, SCA, IaC). "
+            f"Default: disabled. Use --stale-days {DEFAULT_STALE_DAYS} for 30-day threshold. "
+            f"Set to 0 to disable."
+        ),
+    )
     parser.add_argument(
         "--hostname", metavar="HOSTNAME", default=None,
         help=(
@@ -708,6 +823,13 @@ def main() -> None:
     if args.min_remaining < 0:
         print("Error: --min-remaining must be >= 0", file=sys.stderr)
         sys.exit(1)
+
+    if args.stale_days is not None and args.stale_days < 0:
+        print("Error: --stale-days must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    if args.delete and args.stale_days is not None:
+        print("Warning: --stale-days is ignored in delete mode.", file=sys.stderr)
 
     if shutil.which("gh") is None:
         print("Error: GitHub CLI (gh) is not installed.", file=sys.stderr)
@@ -768,7 +890,12 @@ def main() -> None:
         print("================================================================\n")
         fieldnames = ["org", "repo", "primary_language", "is_archived", "issues_deleted", "action"]
     else:
-        fieldnames = ["org", "repo", "primary_language", "issues_enabled", "is_archived", "action"]
+        fieldnames = ["org", "repo", "primary_language", "issues_enabled", "is_archived",
+                      "last_check_date", "days_since_check", "action"]
+        if args.stale_days:
+            print("================================================================")
+            print(f"STALE CHECK MODE: Creating issues for repos not scanned in {args.stale_days} days")
+            print("================================================================\n")
 
     output_file = args.output
     all_stats: list[OrgStats] = []
@@ -787,14 +914,14 @@ def main() -> None:
 
                 repos = fetch_repos(org, args.repo_limit, ctx)
                 if not repos:
-                    print(f"  No repos returned for '{org}' — skipping.", file=sys.stderr)
+                    print(f"  No repos returned for '{org}' - skipping.", file=sys.stderr)
                     all_stats.append(OrgStats(org=org))
                     continue
 
                 if args.delete:
                     stats = run_delete_mode(org, repos, csv_writer, csv_file, ctx)
                 else:
-                    stats = run_create_mode(org, repos, csv_writer, csv_file, ctx)
+                    stats = run_create_mode(org, repos, csv_writer, csv_file, ctx, args.stale_days)
 
                 all_stats.append(stats)
 
@@ -803,7 +930,7 @@ def main() -> None:
         sys.exit(130)
 
     if total_orgs > 1 and all_stats:
-        print_multi_org_summary(all_stats, args.delete, output_file)
+        print_multi_org_summary(all_stats, args.delete, args.stale_days, output_file)
 
     print(f"\nCSV Output: {output_file}")
 

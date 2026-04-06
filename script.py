@@ -4,12 +4,14 @@ script.py - Create or close Veracode baseline scan trigger issues across all rep
 Supports a single org (positional arg) or multiple orgs via --org-file.
 Supports GitHub.com, GitHub Enterprise Cloud (GHEC), and GitHub Enterprise Server (GHES) via --hostname.
 Supports --stale-days to only create issues for repos not scanned within N days.
+Supports --repo-file to target specific repos and --repo-wildcard for pattern matching.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import io
 import json
 import os
@@ -33,6 +35,7 @@ DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
 DEFAULT_STALE_DAYS = 30
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,38}$")
+_VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 _REPO_JQ = (
     "[.[] | {"
@@ -54,6 +57,10 @@ _RATE_LIMIT_PATTERNS = (
 
 class OrgFileError(Exception):
     """Raised for unrecoverable org-file loading failures. Caught in main()."""
+
+
+class RepoFileError(Exception):
+    """Raised for unrecoverable repo-file loading failures. Caught in main()."""
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +153,11 @@ def validate_org_name(org: str) -> bool:
     return bool(_VALID_ORG_RE.match(org))
 
 
+def validate_repo_name(repo: str) -> bool:
+    """Return True if repo is a plausible GitHub repo name (without org prefix)."""
+    return bool(_VALID_REPO_RE.match(repo))
+
+
 def load_orgs_from_file(file_path: str) -> list[str]:
     """Parse an org list file. Validates all names before returning.
 
@@ -173,6 +185,64 @@ def load_orgs_from_file(file_path: str) -> list[str]:
         )
 
     return orgs
+
+
+def load_repos_from_file(file_path: str) -> list[str]:
+    """Parse a repo list file. Returns repo names (without org prefix).
+
+    Raises:
+        RepoFileError: if the file is missing, empty, or contains invalid repo names.
+    """
+    if not os.path.isfile(file_path):
+        raise RepoFileError(f"Repo file not found: {file_path}")
+
+    with open(file_path, encoding="utf-8") as fh:
+        repos = [
+            stripped for line in fh
+            if (stripped := line.strip()) and not stripped.startswith("#")
+        ]
+
+    if not repos:
+        raise RepoFileError(
+            f"No repo names found in '{file_path}' (all lines are blank or comments)."
+        )
+
+    invalid = [r for r in repos if not validate_repo_name(r)]
+    if invalid:
+        raise RepoFileError(
+            f"Invalid repo name(s) in '{file_path}': {', '.join(invalid)}"
+        )
+
+    return repos
+
+
+def filter_repos_by_names(repos: list[dict], target_names: list[str]) -> list[dict]:
+    """Filter repos to only those matching target names (case-insensitive)."""
+    target_set = {name.lower() for name in target_names}
+    filtered = []
+    for repo in repos:
+        repo_name = repo["nameWithOwner"].split("/", 1)[-1].lower()
+        if repo_name in target_set:
+            filtered.append(repo)
+    return filtered
+
+
+def filter_repos_by_wildcard(repos: list[dict], pattern: str) -> list[dict]:
+    """Filter repos using fnmatch-style wildcard pattern (case-insensitive).
+    
+    Supports:
+      - "example*" matches repos starting with "example"
+      - "*example" matches repos ending with "example"
+      - "*example*" matches repos containing "example"
+      - "ex?mple" matches single character wildcard
+    """
+    pattern_lower = pattern.lower()
+    filtered = []
+    for repo in repos:
+        repo_name = repo["nameWithOwner"].split("/", 1)[-1].lower()
+        if fnmatch.fnmatch(repo_name, pattern_lower):
+            filtered.append(repo)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +847,20 @@ def main() -> None:
         help="Path to a text file with one org name per line (# lines are comments)",
     )
 
+    repo_filter_group = parser.add_mutually_exclusive_group()
+    repo_filter_group.add_argument(
+        "--repo-file", metavar="FILE",
+        help="Path to a text file with one repo name per line (without org prefix, # lines are comments)",
+    )
+    repo_filter_group.add_argument(
+        "--repo-wildcard", metavar="PATTERN",
+        help=(
+            "Filter repos using wildcard pattern. Examples: "
+            "'example*' (starts with), '*example' (ends with), '*example*' (contains), "
+            "'ex?mple' (single char wildcard). Case-insensitive."
+        ),
+    )
+
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
     parser.add_argument(
         "--stale-days", type=int, metavar="N", default=None,
@@ -854,6 +938,22 @@ def main() -> None:
         check_every=args.rl_check_every,
     )
 
+    # --- Load repo filter if specified ---
+    repo_filter_names: list[str] | None = None
+    repo_filter_pattern: str | None = None
+
+    if args.repo_file:
+        try:
+            repo_filter_names = load_repos_from_file(args.repo_file)
+        except RepoFileError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(repo_filter_names)} repo name(s) from '{args.repo_file}'.")
+
+    if args.repo_wildcard:
+        repo_filter_pattern = args.repo_wildcard
+        print(f"Using repo wildcard filter: '{repo_filter_pattern}'")
+
     # --- Resolve org list ---
     if args.org_file:
         try:
@@ -915,6 +1015,20 @@ def main() -> None:
                 repos = fetch_repos(org, args.repo_limit, ctx)
                 if not repos:
                     print(f"  No repos returned for '{org}' - skipping.", file=sys.stderr)
+                    all_stats.append(OrgStats(org=org))
+                    continue
+
+                # Apply repo filtering
+                original_count = len(repos)
+                if repo_filter_names:
+                    repos = filter_repos_by_names(repos, repo_filter_names)
+                    print(f"Filtered to {len(repos)}/{original_count} repos matching --repo-file")
+                elif repo_filter_pattern:
+                    repos = filter_repos_by_wildcard(repos, repo_filter_pattern)
+                    print(f"Filtered to {len(repos)}/{original_count} repos matching '{repo_filter_pattern}'")
+
+                if not repos:
+                    print(f"  No repos match filter for '{org}' - skipping.", file=sys.stderr)
                     all_stats.append(OrgStats(org=org))
                     continue
 

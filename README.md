@@ -1,6 +1,6 @@
 # Veracode Workflow App - Issue Scan Trigger Script
 
-Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, stale scan detection, and multi-org runs with a CSV audit trail.
+Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, stale scan detection, repo filtering, and multi-org runs with a CSV audit trail.
 
 ---
 
@@ -9,12 +9,13 @@ Creates or closes GitHub issues across repositories in one or more GitHub organi
 For each repository in the target organization, the script:
 
 1. Skips archived repositories
-2. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
-3. Temporarily enables Issues if disabled (restores original state after)
-4. Checks for an existing open trigger issue to avoid duplicates
-5. Creates the trigger issue
-6. Writes a per-repo result row to the CSV audit trail
-7. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
+2. Optionally filters repos by name list (`--repo-file`) or wildcard pattern (`--repo-wildcard`)
+3. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
+4. Temporarily enables Issues if disabled (restores original state after)
+5. Checks for an existing open trigger issue to avoid duplicates
+6. Creates the trigger issue
+7. Writes a per-repo result row to the CSV audit trail
+8. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
 
 > **Scans are not triggered directly.** The issue acts as a signal to the Veracode Workflow App, which initiates scans based on the `veracode.yml` configuration in each repository. If `issues.trigger` is not set to `true` in `veracode.yml`, no scan will start.
 
@@ -32,6 +33,20 @@ python script.py my-github-org
 
 ```bash
 python script.py --org-file orgs.txt
+```
+
+### Target specific repos by name
+
+```bash
+python script.py --repo-file repos.txt my-github-org
+```
+
+### Target repos matching a wildcard pattern
+
+```bash
+python script.py --repo-wildcard "api-*" my-github-org
+python script.py --repo-wildcard "*-service" my-github-org
+python script.py --repo-wildcard "*core*" my-github-org
 ```
 
 ### Only trigger repos not scanned in the last 30 days
@@ -114,6 +129,8 @@ The command value must exactly match the Workflow App command name. This mismatc
 |------|-------------|
 | `org` | Single org name (positional argument) |
 | `--org-file FILE` | Path to a text file with one org per line. `#` lines and blank lines are ignored. Mutually exclusive with the positional org argument. |
+| `--repo-file FILE` | Path to a text file with one repo name per line (without org prefix). `#` lines and blank lines are ignored. Mutually exclusive with `--repo-wildcard`. |
+| `--repo-wildcard PATTERN` | Filter repos using wildcard pattern. Case-insensitive. Mutually exclusive with `--repo-file`. See [Repo Filtering](#repo-filtering) for pattern syntax. |
 | `--delete` | Close previously created trigger issues instead of creating new ones |
 | `--stale-days N` | Only create issues for repos not scanned in the last N days. Checks for Veracode check runs (SAST, SCA, IaC). Disabled by default. Set to 0 to disable. Ignored in delete mode. |
 | `--hostname HOSTNAME` | GitHub hostname. Omit for github.com. GHES: `github.mycompany.com`. GHEC: `myorg.ghe.com`. Sets `GH_HOST` per-call without modifying your shell. |
@@ -123,6 +140,76 @@ The command value must exactly match the Workflow App command name. This mismatc
 | `--rl-check-every N` | Check rate limit every N gh calls (default: `50`) |
 
 Environment variables `GH_RL_MIN_REMAINING`, `GH_RL_CHECK_EVERY`, and `REPO_LIST_LIMIT` set the same defaults as their flag equivalents. Flags take precedence.
+
+---
+
+## Repo Filtering
+
+Use `--repo-file` or `--repo-wildcard` to target a subset of repositories within an org. Both options work with single-org and multi-org (`--org-file`) modes.
+
+### Filter by Name List (`--repo-file`)
+
+Create a text file with one repo name per line (without the org prefix):
+
+```text
+# repos.txt
+# Target these specific repos
+my-api
+frontend-app
+shared-lib
+internal-tools
+```
+
+```bash
+python script.py --repo-file repos.txt my-github-org
+python script.py --repo-file repos.txt --org-file orgs.txt
+```
+
+Matching is case-insensitive. Lines starting with `#` and blank lines are ignored.
+
+### Filter by Wildcard Pattern (`--repo-wildcard`)
+
+Use glob-style patterns to match repo names:
+
+| Pattern | Matches |
+|---------|---------|
+| `example*` | Repos starting with "example" (e.g., `example-api`, `example-frontend`) |
+| `*example` | Repos ending with "example" (e.g., `my-example`, `test-example`) |
+| `*example*` | Repos containing "example" (e.g., `my-example-api`, `example`, `test-example-v2`) |
+| `ex?mple` | Single character wildcard (e.g., `example`, `ex1mple`, `ex-mple`) |
+| `api-v[12]` | Character set (e.g., `api-v1`, `api-v2`) |
+
+```bash
+# All repos starting with "api-"
+python script.py --repo-wildcard "api-*" my-github-org
+
+# All repos ending with "-service"
+python script.py --repo-wildcard "*-service" my-github-org
+
+# All repos containing "core"
+python script.py --repo-wildcard "*core*" my-github-org
+
+# Combined with multi-org
+python script.py --repo-wildcard "*-backend" --org-file orgs.txt
+```
+
+Matching is case-insensitive. The pattern applies to the repo name only (not the org prefix).
+
+### Combining with Other Filters
+
+Repo filters can be combined with `--stale-days`:
+
+```bash
+# Only api-* repos not scanned in 30 days
+python script.py --repo-wildcard "api-*" --stale-days 30 my-github-org
+```
+
+Repo filters also work with `--delete`:
+
+```bash
+# Close issues only on specific repos
+python script.py --delete --repo-file repos.txt my-github-org
+```
 
 ---
 
@@ -268,8 +355,17 @@ To re-trigger scans:
 - **"No org names found" when using --org-file**
   - Every line is blank or starts with `#`. Add at least one uncommented org name.
 
+- **"No repo names found" when using --repo-file**
+  - Every line is blank or starts with `#`. Add at least one uncommented repo name.
+
 - **"Invalid org name(s)" when using --org-file or a positional org**
   - Org names must start with a letter or digit, contain only alphanumeric characters and hyphens, and be at most 39 characters.
+
+- **"Invalid repo name(s)" when using --repo-file**
+  - Repo names must contain only alphanumeric characters, hyphens, underscores, and periods.
+
+- **"No repos match filter" after applying --repo-file or --repo-wildcard**
+  - Verify repo names/patterns are correct. Matching is case-insensitive. Check that the repos exist in the target org.
 
 - **"Could not enable issues" on some repositories**
   - The token lacks admin permissions on those repos. The script skips them and records `skipped_cant_enable_issues` in the CSV.
@@ -282,10 +378,3 @@ To re-trigger scans:
 
 - **GHEC: targeting the wrong GitHub instance**
   - Use `--hostname myorg.ghe.com` to force the correct host. GHEC uses `GH_TOKEN`, not `GH_ENTERPRISE_TOKEN`.
-
-- **Stale check not finding Veracode runs**
-  - Verify that Veracode check runs appear on commits/PRs in the repo. The script looks for check names starting with "Veracode". If your Workflow App uses different naming, update the filter in `get_last_veracode_check()`.
-
----
-
-Supported platforms: GitHub.com · GitHub Enterprise Cloud · GitHub Enterprise Server

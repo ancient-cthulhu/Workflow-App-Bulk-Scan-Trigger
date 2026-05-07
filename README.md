@@ -232,6 +232,27 @@ python script.py --stale-days 0 my-github-org
 
 Repos with no Veracode check history are treated as stale and will have issues created.
 
+> **API cost note:** When `--stale-days` is set, the script makes one additional API call per repo to query Veracode check runs on the default branch. The default branch is fetched alongside the initial repo list, so no extra round-trip is needed to discover it.
+
+---
+
+## Rate Limit Handling
+
+The script handles three failure modes automatically:
+
+- **Core REST limits**: sleeps until the rate-limit reset epoch and retries.
+- **Auth failures** (bad credentials, 404, insufficient permissions): not retried; reported immediately and recorded in the CSV.
+
+Between content-creation calls (issue create / close), a 1 second throttle is applied to reduce secondary rate limit risk on bursty operations.
+
+To reduce risk further on large runs, tighten the proactive thresholds:
+
+```bash
+python script.py --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+```
+
+Rate limit pauses are logged to stderr so the CSV output stays clean.
+
 ---
 
 ## Platform Notes
@@ -275,10 +296,6 @@ For very large orgs, tighten rate limit controls:
 python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
 ```
 
-Rate limit pauses are logged to stderr so the CSV output stays clean.
-
-> **Note:** When using `--stale-days`, the script makes an additional API call per repo to query check runs. For very large orgs, this increases API usage. Adjust `--min-remaining` and `--rl-check-every` accordingly.
-
 ---
 
 ## Output
@@ -301,11 +318,13 @@ Rate limit pauses are logged to stderr so the CSV output stays clean.
 | `action` value | Meaning |
 |----------------|---------|
 | `created` | Issue created successfully |
+| `created_restore_failed` | Issue created, but failed to restore the original issues-disabled state on the repo. The repo now has Issues enabled when it previously did not - manual cleanup may be required. |
 | `skipped_recent_check` | Veracode check found within `--stale-days` threshold |
 | `skipped_existing_issue` | Open trigger issue already exists |
 | `skipped_archived` | Repository is archived, skipped |
 | `skipped_cant_enable_issues` | Issues could not be enabled (insufficient permissions) |
 | `failed_create` | Issue creation API call failed |
+| `failed_create_restore_failed` | Issue creation failed AND failed to restore the original issues-disabled state. Manual cleanup may be required. |
 | `failed_query_issues` | Could not check for existing issues; creation skipped to prevent duplicates |
 
 #### Delete Mode
@@ -331,7 +350,7 @@ Rate limit pauses are logged to stderr so the CSV output stays clean.
 
 ## Duplicate Protection
 
-Before creating an issue, the script checks for an existing open issue with the same title. If the check fails (API error), creation is skipped and recorded as `failed_query_issues` - this prevents accidental duplicates when the existing-issue check cannot be completed.
+Before creating an issue, the script checks for an existing open issue with the same title using the GitHub REST issues endpoint with client-side title matching. If the check fails (API error), creation is skipped and recorded as `failed_query_issues` this prevents accidental duplicates when the existing-issue check cannot be completed.
 
 To re-trigger scans:
 
@@ -343,8 +362,8 @@ To re-trigger scans:
 
 ## Troubleshooting
 
-- **"API rate limit exceeded / HTTP 403 / abuse detection"**
-  - The script automatically sleeps until reset and retries. To reduce risk on large runs:
+- **"API rate limit exceeded / HTTP 403 / secondary rate limit / submitted too quickly"**
+  - Handled automatically. See [Rate Limit Handling](#rate-limit-handling) for the exact retry behavior. To reduce risk on large runs:
     ```bash
     python script.py --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
     ```
@@ -359,7 +378,7 @@ To re-trigger scans:
   - Every line is blank or starts with `#`. Add at least one uncommented repo name.
 
 - **"Invalid org name(s)" when using --org-file or a positional org**
-  - Org names must start with a letter or digit, contain only alphanumeric characters and hyphens, and be at most 39 characters.
+  - Org names must start and end with a letter or digit, contain only alphanumeric characters and hyphens between them, and be at most 39 characters.
 
 - **"Invalid repo name(s)" when using --repo-file**
   - Repo names must contain only alphanumeric characters, hyphens, underscores, and periods.
@@ -369,6 +388,9 @@ To re-trigger scans:
 
 - **"Could not enable issues" on some repositories**
   - The token lacks admin permissions on those repos. The script skips them and records `skipped_cant_enable_issues` in the CSV.
+
+- **`created_restore_failed` or `failed_create_restore_failed` rows in the CSV**
+  - The script temporarily enabled Issues on a repo, then could not re-disable them afterward. The repo now has Issues enabled when it previously did not. Filter the CSV for these actions and manually disable Issues if needed.
 
 - **"SyntaxError" or unexpected failures**
   - Requires Python 3.10 or newer. Check with `python --version`.

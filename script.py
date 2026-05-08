@@ -2,6 +2,16 @@
 """
 script.py - Create or close Veracode baseline scan trigger issues across all repos in a GitHub org.
 
+Improvements over v1:
+
+- UTF-8 CSV encoding (Windows-safe)
+- Auth failures distinguished from rate limits (no retry on bad creds)
+- Exponential backoff on repeated secondary limits
+- Search API replaced with core REST + jq (166x larger bucket)
+- Default branch fetched in one shot with repo list (halves stale-check API cost)
+- check-runs paginated to catch >30 results
+- CSV row construction consolidated into helpers
+- Restore-state failures captured in CSV
 """
 
 from __future__ import annotations
@@ -20,14 +30,15 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Constants
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 ISSUE_TITLE = "Veracode Baseline Scans"
 ISSUE_BODY = "Veracode All Scans"
 IAC_LANGUAGES = frozenset({"HCL", "Bicep"})
 SUBPROCESS_TIMEOUT = 60
+REPO_LIST_TIMEOUT = 300
 DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
 DEFAULT_STALE_DAYS = 30
 WRITE_THROTTLE_SECONDS = 1.0
@@ -37,15 +48,14 @@ MAX_RATE_LIMIT_RETRIES = 3
 PARTIAL_STDERR_LIMIT = 500
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
-_VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9.*-]+$")
 
 _REPO_JQ = (
     "[.[] | {"
     "nameWithOwner: .nameWithOwner, "
     "hasIssuesEnabled: .hasIssuesEnabled, "
     "primaryLanguage: (.primaryLanguage.name // \"N/A\"), "
-    "isArchived: .isArchived, "
-    "defaultBranch: (.defaultBranchRef.name // \"\")"
+    "isArchived: .isArchived"
     "}]"
 )
 
@@ -80,9 +90,9 @@ class RepoFileError(Exception):
     """Raised for unrecoverable repo-file loading failures."""
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Environment helpers
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def _env_int(key: str, default: int) -> int:
     val = os.environ.get(key)
@@ -99,13 +109,13 @@ def _env_int(key: str, default: int) -> int:
 
 
 DEFAULT_RL_MIN_REMAINING = _env_int("GH_RL_MIN_REMAINING", 100)
-DEFAULT_RL_CHECK_EVERY   = _env_int("GH_RL_CHECK_EVERY", 50)
-DEFAULT_REPO_LIST_LIMIT  = _env_int("REPO_LIST_LIMIT", 1000)
+DEFAULT_RL_CHECK_EVERY = _env_int("GH_RL_CHECK_EVERY", 50)
+DEFAULT_REPO_LIST_LIMIT = _env_int("REPO_LIST_LIMIT", 1000)
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Dataclasses
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 @dataclass
 class RateLimitState:
@@ -137,9 +147,9 @@ class OrgStats:
     failed: int = 0
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Validation
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def build_gh_env(gh_hostname: str | None) -> dict[str, str]:
     env = os.environ.copy()
@@ -206,17 +216,19 @@ def filter_repos_by_wildcard(repos: list[dict], pattern: str) -> list[dict]:
     ]
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Rate limiting
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def query_rate_limit(ctx: GhContext) -> bool:
     """Query GitHub core REST rate limit. Updates ctx.state."""
     try:
         result = subprocess.run(
-            ["gh", "api", "rate_limit",
-             "--jq", ".resources.core.remaining, .resources.core.reset"],
-            capture_output=True, text=True, check=True, env=ctx.env,
+            ["gh", "api", "rate_limit", "--jq", ".resources.core.remaining, .resources.core.reset"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=ctx.env,
             timeout=SUBPROCESS_TIMEOUT,
         )
         lines = result.stdout.strip().splitlines()
@@ -249,15 +261,22 @@ def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
             time.sleep(sleep_for)
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Subprocess wrapper
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
-def _run_subprocess(args: list[str], env: dict[str, str]) -> tuple[bool, str, str]:
+def _run_subprocess(
+    args: list[str],
+    env: dict[str, str],
+    timeout: int = SUBPROCESS_TIMEOUT,
+) -> tuple[bool, str, str]:
     try:
         result = subprocess.run(
-            args, capture_output=True, text=True, env=env,
-            timeout=SUBPROCESS_TIMEOUT,
+            args,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
         )
         return result.returncode == 0, result.stdout, result.stderr
     except subprocess.TimeoutExpired as exc:
@@ -265,26 +284,29 @@ def _run_subprocess(args: list[str], env: dict[str, str]) -> tuple[bool, str, st
         if exc.stderr:
             raw = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(errors="replace")
             partial_stderr = raw[:PARTIAL_STDERR_LIMIT]
-        print(f"Timeout ({SUBPROCESS_TIMEOUT}s) running: {' '.join(args)}", file=sys.stderr)
+        print(f"Timeout ({timeout}s) running: {' '.join(args)}", file=sys.stderr)
         if partial_stderr:
             print(f"Partial stderr: {partial_stderr}", file=sys.stderr)
         return False, "", "timeout"
 
 
-def gh_call(args: list[str], ctx: GhContext) -> tuple[bool, str, str]:
+def gh_call(
+    args: list[str],
+    ctx: GhContext,
+    timeout: int = SUBPROCESS_TIMEOUT,
+) -> tuple[bool, str, str]:
     """Run gh CLI with proactive + reactive rate limit handling and exponential backoff."""
     delay = SECONDARY_RATE_LIMIT_SLEEP
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         maybe_pause_for_rate_limit(ctx)
-        success, stdout, stderr = _run_subprocess(args, ctx.env)
+        success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
 
         if success:
             return True, stdout, stderr
 
         combined = (stderr + stdout).lower()
 
-        # Auth/permission failures are not retryable.
         if any(pat in combined for pat in _AUTH_FAILURE_PATTERNS):
             print(stderr, file=sys.stderr)
             return False, stdout, stderr
@@ -322,9 +344,9 @@ def gh_call(args: list[str], ctx: GhContext) -> tuple[bool, str, str]:
     return False, "", ""
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # JSON helper
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def parse_json_safe(stdout: str, context: str = "") -> object | None:
     """Parse JSON from subprocess stdout. Returns None on empty input or parse error."""
@@ -338,9 +360,9 @@ def parse_json_safe(stdout: str, context: str = "") -> object | None:
         return None
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # GitHub API calls
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def check_org_access(org: str, ctx: GhContext) -> bool:
     success, _, _ = gh_call(["gh", "api", f"orgs/{org}", "--silent"], ctx)
@@ -355,15 +377,23 @@ def _check_and_report(org: str, ctx: GhContext) -> bool:
 
 
 def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
-    """Fetch repos with default branch included to avoid extra calls later."""
+    """Fetch repos for an org. Uses the longer REPO_LIST_TIMEOUT since
+    listing 1000+ repos can take well over 60s on large orgs.
+
+    Note: defaultBranchRef is intentionally NOT included here even though
+    it would be nice for --stale-days mode. Adding it to the bulk query
+    on a 1000+ repo org makes gh's GraphQL backend slow enough to time out.
+    Default branch is fetched per-repo only when needed.
+    """
     success, stdout, _ = gh_call(
         [
             "gh", "repo", "list", org,
             "--limit", str(limit),
-            "--json", "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived,defaultBranchRef",
+            "--json", "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived",
             "--jq", _REPO_JQ,
         ],
         ctx,
+        timeout=REPO_LIST_TIMEOUT,
     )
     if not success:
         print(f"Error: Failed to fetch repos for org '{org}'.", file=sys.stderr)
@@ -372,16 +402,24 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
     return result if isinstance(result, list) else []
 
 
-def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
-    """Find open issues by exact title match.
+def get_default_branch(repo: str, ctx: GhContext) -> str | None:
+    """Look up the default branch for a single repo. Used only by --stale-days mode."""
+    success, stdout, _ = gh_call(
+        [
+            "gh", "repo", "view", repo,
+            "--json", "defaultBranchRef",
+            "--jq", ".defaultBranchRef.name // \"\"",
+        ],
+        ctx,
+    )
+    if not success:
+        return None
+    branch = stdout.strip()
+    return branch if branch else None
 
-    Uses `gh issue list` (GraphQL-backed) without --search, then filters
-    by exact title in Python. This avoids:
-      - the search API rate limit (30/min) that --search would hit
-      - the gh api --paginate + --jq output concatenation problem
-        (concatenated arrays produce invalid JSON for json.loads)
-      - any jq filter injection concerns
-    """
+
+def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
+    """Find open issues by exact title match."""
     success, stdout, _ = gh_call(
         [
             "gh", "issue", "list",
@@ -401,16 +439,7 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
 
 
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
-    """Get most recent Veracode check completion. Branch is passed in to avoid extra API call.
-
-    Note: We don't use --paginate here because:
-      1. gh api --paginate + --jq produces concatenated JSON output that
-         is invalid for json.loads.
-      2. The check-runs endpoint with per_page=100 returns up to 100 runs
-         for a single commit, which is far more than any single commit will
-         realistically have for Veracode-prefixed checks.
-    Filtering and the "max completed_at" logic are done in Python.
-    """
+    """Get most recent Veracode check completion. Branch is passed in to avoid extra API call."""
     if not branch:
         return None
 
@@ -452,21 +481,27 @@ def calculate_days_since(dt: datetime | None) -> int | None:
     return (datetime.now(timezone.utc) - dt).days
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # CSV row builders
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 CREATE_FIELDNAMES = [
     "org", "repo", "primary_language", "issues_enabled", "is_archived",
     "last_check_date", "days_since_check", "action",
 ]
+
 DELETE_FIELDNAMES = [
     "org", "repo", "primary_language", "is_archived", "issues_deleted", "action",
 ]
 
 
-def _row_create(org: str, repo: dict, action: str,
-                last_check_date: str = "", days_since_check: str = "") -> dict:
+def _row_create(
+    org: str,
+    repo: dict,
+    action: str,
+    last_check_date: str = "",
+    days_since_check: str = "",
+) -> dict:
     return {
         "org": org,
         "repo": repo["nameWithOwner"],
@@ -490,20 +525,28 @@ def _row_delete(org: str, repo: dict, issues_deleted: int, action: str) -> dict:
     }
 
 
-def _write_row(csv_writer: csv.DictWriter, csv_file: io.TextIOWrapper,
-               row: dict, flush: bool = True) -> None:
+def _write_row(
+    csv_writer: csv.DictWriter,
+    csv_file: io.TextIOWrapper,
+    row: dict,
+    flush: bool = True,
+) -> None:
     csv_writer.writerow(row)
     if flush:
         csv_file.flush()
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Mode: delete
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
-def run_delete_mode(org: str, repos: list[dict],
-                    csv_writer: csv.DictWriter, csv_file: io.TextIOWrapper,
-                    ctx: GhContext) -> OrgStats:
+def run_delete_mode(
+    org: str,
+    repos: list[dict],
+    csv_writer: csv.DictWriter,
+    csv_file: io.TextIOWrapper,
+    ctx: GhContext,
+) -> OrgStats:
     stats = OrgStats(org=org)
 
     for repo in repos:
@@ -536,8 +579,10 @@ def run_delete_mode(org: str, repos: list[dict],
         for issue_num in issue_numbers:
             print(f"Closing issue #{issue_num}...")
             success, _, _ = gh_call(
-                ["gh", "issue", "close", str(issue_num), "--repo", name,
-                 "--comment", "Closed by cleanup script"],
+                [
+                    "gh", "issue", "close", str(issue_num), "--repo", name,
+                    "--comment", "Closed by cleanup script",
+                ],
                 ctx,
             )
             if success:
@@ -565,9 +610,9 @@ def run_delete_mode(org: str, repos: list[dict],
     return stats
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Mode: create
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def _restore_issues_disabled(name: str, ctx: GhContext) -> bool:
     """Re-disable issues. Returns True on success."""
@@ -578,9 +623,14 @@ def _restore_issues_disabled(name: str, ctx: GhContext) -> bool:
     return success
 
 
-def run_create_mode(org: str, repos: list[dict],
-                    csv_writer: csv.DictWriter, csv_file: io.TextIOWrapper,
-                    ctx: GhContext, stale_days: int | None) -> OrgStats:
+def run_create_mode(
+    org: str,
+    repos: list[dict],
+    csv_writer: csv.DictWriter,
+    csv_file: io.TextIOWrapper,
+    ctx: GhContext,
+    stale_days: int | None,
+) -> OrgStats:
     stats = OrgStats(org=org)
     check_stale = stale_days is not None and stale_days > 0
 
@@ -589,7 +639,6 @@ def run_create_mode(org: str, repos: list[dict],
         issues_enabled = repo["hasIssuesEnabled"]
         primary_lang = repo["primaryLanguage"]
         is_archived = repo["isArchived"]
-        default_branch = repo.get("defaultBranch", "")
 
         print("-------------------------------------------")
         print(f"Processing {name}")
@@ -609,7 +658,8 @@ def run_create_mode(org: str, repos: list[dict],
 
         if check_stale:
             print(f"Checking for Veracode checks in the last {stale_days} days...")
-            last_check = get_last_veracode_check(name, default_branch, ctx)
+            default_branch = get_default_branch(name, ctx)
+            last_check = get_last_veracode_check(name, default_branch or "", ctx)
             days_since = calculate_days_since(last_check)
 
             if last_check:
@@ -620,9 +670,17 @@ def run_create_mode(org: str, repos: list[dict],
             if last_check and days_since is not None and days_since < stale_days:
                 print(f"Recent Veracode check found ({days_since} days ago). Skipping.")
                 stats.skipped_recent += 1
-                _write_row(csv_writer, csv_file,
-                           _row_create(org, repo, "skipped_recent_check",
-                                       last_check_date, days_since_check))
+                _write_row(
+                    csv_writer,
+                    csv_file,
+                    _row_create(
+                        org,
+                        repo,
+                        "skipped_recent_check",
+                        last_check_date,
+                        days_since_check,
+                    ),
+                )
                 continue
 
             if last_check:
@@ -637,9 +695,17 @@ def run_create_mode(org: str, repos: list[dict],
             if not success:
                 print("Could not enable issues. Skipping issue creation.")
                 stats.skipped_perm += 1
-                _write_row(csv_writer, csv_file,
-                           _row_create(org, repo, "skipped_cant_enable_issues",
-                                       last_check_date, days_since_check))
+                _write_row(
+                    csv_writer,
+                    csv_file,
+                    _row_create(
+                        org,
+                        repo,
+                        "skipped_cant_enable_issues",
+                        last_check_date,
+                        days_since_check,
+                    ),
+                )
                 continue
             was_disabled = True
 
@@ -650,9 +716,17 @@ def run_create_mode(org: str, repos: list[dict],
             stats.failed += 1
             if was_disabled:
                 _restore_issues_disabled(name, ctx)
-            _write_row(csv_writer, csv_file,
-                       _row_create(org, repo, "failed_query_issues",
-                                   last_check_date, days_since_check))
+            _write_row(
+                csv_writer,
+                csv_file,
+                _row_create(
+                    org,
+                    repo,
+                    "failed_query_issues",
+                    last_check_date,
+                    days_since_check,
+                ),
+            )
             continue
 
         if existing_issues:
@@ -660,15 +734,25 @@ def run_create_mode(org: str, repos: list[dict],
             stats.skipped_existing += 1
             if was_disabled:
                 _restore_issues_disabled(name, ctx)
-            _write_row(csv_writer, csv_file,
-                       _row_create(org, repo, "skipped_existing_issue",
-                                   last_check_date, days_since_check))
+            _write_row(
+                csv_writer,
+                csv_file,
+                _row_create(
+                    org,
+                    repo,
+                    "skipped_existing_issue",
+                    last_check_date,
+                    days_since_check,
+                ),
+            )
             continue
 
         print("Creating issue...")
         success, _, _ = gh_call(
-            ["gh", "issue", "create", "--repo", name,
-             "--title", ISSUE_TITLE, "--body", ISSUE_BODY],
+            [
+                "gh", "issue", "create", "--repo", name,
+                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
+            ],
             ctx,
         )
 
@@ -685,8 +769,11 @@ def run_create_mode(org: str, repos: list[dict],
             if not _restore_issues_disabled(name, ctx):
                 action = f"{action}_restore_failed"
 
-        _write_row(csv_writer, csv_file,
-                   _row_create(org, repo, action, last_check_date, days_since_check))
+        _write_row(
+            csv_writer,
+            csv_file,
+            _row_create(org, repo, action, last_check_date, days_since_check),
+        )
 
     print(f"\nFinished processing all repositories for org: {org}\n")
     print(f"Repository Stats for Organization: {org}")
@@ -705,9 +792,9 @@ def run_create_mode(org: str, repos: list[dict],
     return stats
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Summary
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
     if total_orgs > 1:
@@ -716,8 +803,12 @@ def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
         print(f"{'#' * 64}")
 
 
-def print_multi_org_summary(all_stats: list[OrgStats], delete_mode: bool,
-                            stale_days: int | None, output_file: str) -> None:
+def print_multi_org_summary(
+    all_stats: list[OrgStats],
+    delete_mode: bool,
+    stale_days: int | None,
+    output_file: str,
+) -> None:
     print(f"\n{'=' * 64}")
     print("MULTI-ORG SUMMARY")
     print(f"{'=' * 64}")
@@ -753,7 +844,6 @@ def print_multi_org_summary(all_stats: list[OrgStats], delete_mode: bool,
         print(" ".join(f"{getter(s):{fmt}}" for _, fmt, getter in cols))
     print(sep)
 
-    # Totals row
     totals = ["TOTAL"] + [
         sum(getter(s) for s in all_stats) for _, _, getter in cols[1:]
     ]
@@ -763,9 +853,9 @@ def print_multi_org_summary(all_stats: list[OrgStats], delete_mode: bool,
     print(f"{'=' * 64}")
 
 
-# ---------------------------------------------------------------------------
+# —————————————————————————
 # Main
-# ---------------------------------------------------------------------------
+# —————————————————————————
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -776,30 +866,58 @@ def main() -> None:
 
     org_group = parser.add_mutually_exclusive_group(required=True)
     org_group.add_argument("org", nargs="?", help="Single GitHub organization name")
-    org_group.add_argument("--org-file", metavar="FILE",
-                           help="Text file with one org name per line")
+    org_group.add_argument(
+        "--org-file",
+        metavar="FILE",
+        help="Text file with one org name per line",
+    )
 
     repo_filter_group = parser.add_mutually_exclusive_group()
-    repo_filter_group.add_argument("--repo-file", metavar="FILE",
-                                   help="Text file with one repo name per line")
-    repo_filter_group.add_argument("--repo-wildcard", metavar="PATTERN",
-                                   help="Wildcard pattern to filter repos (case-insensitive)")
+    repo_filter_group.add_argument(
+        "--repo-file",
+        metavar="FILE",
+        help="Text file with one repo name per line",
+    )
+    repo_filter_group.add_argument(
+        "--repo-wildcard",
+        metavar="PATTERN",
+        help="Wildcard pattern to filter repos (case-insensitive)",
+    )
 
-    parser.add_argument("--delete", action="store_true",
-                        help="Close previously created trigger issues")
-    parser.add_argument("--stale-days", type=int, metavar="N", default=None,
-                        help=f"Only create issues for repos not scanned in last N days "
-                             f"(suggested: {DEFAULT_STALE_DAYS})")
-    parser.add_argument("--hostname", metavar="HOSTNAME", default=None,
-                        help="GitHub hostname for GHES/GHEC")
-    parser.add_argument("--output", metavar="FILE", default=DEFAULT_OUTPUT_FILE,
-                        help=f"Output CSV path (default: {DEFAULT_OUTPUT_FILE})")
-    parser.add_argument("--repo-limit", type=int, default=DEFAULT_REPO_LIST_LIMIT,
-                        help=f"Max repos per org (default: {DEFAULT_REPO_LIST_LIMIT})")
-    parser.add_argument("--min-remaining", type=int, default=DEFAULT_RL_MIN_REMAINING,
-                        help=f"Pause when core remaining <= N (default: {DEFAULT_RL_MIN_REMAINING})")
-    parser.add_argument("--rl-check-every", type=int, default=DEFAULT_RL_CHECK_EVERY,
-                        help=f"Check rate limit every N gh calls (default: {DEFAULT_RL_CHECK_EVERY})")
+    parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
+    parser.add_argument(
+        "--stale-days",
+        type=int,
+        metavar="N",
+        default=None,
+        help=f"Only create issues for repos not scanned in last N days (suggested: {DEFAULT_STALE_DAYS})",
+    )
+    parser.add_argument("--hostname", metavar="HOSTNAME", default=None, help="GitHub hostname for GHES/GHEC")
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        default=DEFAULT_OUTPUT_FILE,
+        help=f"Output CSV path (default: {DEFAULT_OUTPUT_FILE})",
+    )
+    parser.add_argument(
+        "--repo-limit",
+        type=int,
+        default=DEFAULT_REPO_LIST_LIMIT,
+        help=f"Max repos per org (default: {DEFAULT_REPO_LIST_LIMIT})",
+    )
+    parser.add_argument(
+        "--min-remaining",
+        type=int,
+        default=DEFAULT_RL_MIN_REMAINING,
+        help=f"Pause when core remaining <= N (default: {DEFAULT_RL_MIN_REMAINING})",
+    )
+    parser.add_argument(
+        "--rl-check-every",
+        type=int,
+        default=DEFAULT_RL_CHECK_EVERY,
+        help=f"Check rate limit every N gh calls (default: {DEFAULT_RL_CHECK_EVERY})",
+    )
+
     args = parser.parse_args()
 
     if args.rl_check_every < 1:

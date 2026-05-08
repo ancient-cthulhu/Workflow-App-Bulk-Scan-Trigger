@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 script.py - Create or close Veracode baseline scan trigger issues across all repos in a GitHub org.
+
 """
 
 from __future__ import annotations
@@ -68,7 +69,6 @@ _AUTH_FAILURE_PATTERNS = (
     "resource not accessible",
     "bad credentials",
     "requires authentication",
-    "not found",  # 404 should not retry
 )
 
 
@@ -373,52 +373,77 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
 
 
 def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
-    """Find open issues by exact title. Uses core REST bucket, not search."""
+    """Find open issues by exact title match.
+
+    Uses `gh issue list` (GraphQL-backed) without --search, then filters
+    by exact title in Python. This avoids:
+      - the search API rate limit (30/min) that --search would hit
+      - the gh api --paginate + --jq output concatenation problem
+        (concatenated arrays produce invalid JSON for json.loads)
+      - any jq filter injection concerns
+    """
     success, stdout, _ = gh_call(
         [
-            "gh", "api", f"repos/{repo}/issues",
-            "--paginate",
-            "-X", "GET",
-            "-f", "state=open",
-            "-f", "per_page=100",
-            "--jq", '[.[] | select(.title == $t and (.pull_request | not)) | .number]',
-            "--arg", "t", title,
+            "gh", "issue", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--limit", "1000",
+            "--json", "number,title",
         ],
         ctx,
     )
     if not success:
         return None
-    result = parse_json_safe(stdout, f"find_open_issues repo={repo}")
-    return result if isinstance(result, list) else None
+    issues = parse_json_safe(stdout, f"find_open_issues repo={repo}")
+    if not isinstance(issues, list):
+        return None
+    return [issue["number"] for issue in issues if issue.get("title") == title]
 
 
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
-    """Get most recent Veracode check completion. Branch is passed in to avoid extra API call."""
+    """Get most recent Veracode check completion. Branch is passed in to avoid extra API call.
+
+    Note: We don't use --paginate here because:
+      1. gh api --paginate + --jq produces concatenated JSON output that
+         is invalid for json.loads.
+      2. The check-runs endpoint with per_page=100 returns up to 100 runs
+         for a single commit, which is far more than any single commit will
+         realistically have for Veracode-prefixed checks.
+    Filtering and the "max completed_at" logic are done in Python.
+    """
     if not branch:
         return None
 
     success, stdout, _ = gh_call(
         [
             "gh", "api", f"repos/{repo}/commits/{branch}/check-runs",
-            "--paginate",
             "-X", "GET",
             "-f", "per_page=100",
-            "--jq",
-            '[.check_runs[] | select(.name | startswith("Veracode")) '
-            '| .completed_at] | map(select(. != null)) | max',
         ],
         ctx,
     )
     if not success:
         return None
 
-    stripped = stdout.strip()
-    if not stripped or stripped == "null":
+    parsed = parse_json_safe(stdout, f"get_last_veracode_check repo={repo}")
+    if not isinstance(parsed, dict):
         return None
-    try:
-        return datetime.fromisoformat(stripped.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+
+    check_runs = parsed.get("check_runs") or []
+    completed_times: list[datetime] = []
+    for run in check_runs:
+        name = run.get("name") or ""
+        completed_at = run.get("completed_at")
+        if not name.startswith("Veracode") or not completed_at:
+            continue
+        try:
+            completed_times.append(
+                datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            )
+        except (ValueError, AttributeError):
+            continue
+
+    return max(completed_times) if completed_times else None
 
 
 def calculate_days_since(dt: datetime | None) -> int | None:

@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 """
 script.py - Create or close Veracode baseline scan trigger issues across all repos in a GitHub org.
-
-Improvements over v1:
-
-- UTF-8 CSV encoding (Windows-safe)
-- Auth failures distinguished from rate limits (no retry on bad creds)
-- Exponential backoff on repeated secondary limits
-- Search API replaced with core REST + jq (166x larger bucket)
-- Default branch fetched in one shot with repo list (halves stale-check API cost)
-- check-runs paginated to catch >30 results
-- CSV row construction consolidated into helpers
-- Restore-state failures captured in CSV
 """
 
 from __future__ import annotations

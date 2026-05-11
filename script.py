@@ -15,13 +15,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-# —————————————————————————
-# Constants
-# —————————————————————————
 
 ISSUE_TITLE = "Veracode Baseline Scans"
 ISSUE_BODY = "Veracode All Scans"
@@ -35,6 +33,18 @@ SECONDARY_RATE_LIMIT_SLEEP = 60
 SECONDARY_BACKOFF_CAP = 600
 MAX_RATE_LIMIT_RETRIES = 3
 PARTIAL_STDERR_LIMIT = 500
+DEFAULT_WORKERS = 5
+MAX_WORKERS = 50
+
+VERACODE_REGIONS = {
+    "commercial": "https://api.veracode.com/appsec/v1",
+    "eu": "https://api.veracode.eu/appsec/v1",
+    "federal": "https://api.veracode.us/appsec/v1",
+}
+VERACODE_PAGE_SIZE = 500
+VERACODE_TIMEOUT = 60
+VERACODE_MAX_RETRIES = 3
+VERACODE_RETRY_SLEEP = 5
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
 _VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9.*-]+$")
@@ -72,16 +82,16 @@ _AUTH_FAILURE_PATTERNS = (
 
 
 class OrgFileError(Exception):
-    """Raised for unrecoverable org-file loading failures."""
+    pass
 
 
 class RepoFileError(Exception):
-    """Raised for unrecoverable repo-file loading failures."""
+    pass
 
 
-# —————————————————————————
-# Environment helpers
-# —————————————————————————
+class VeracodeError(Exception):
+    pass
+
 
 def _env_int(key: str, default: int) -> int:
     val = os.environ.get(key)
@@ -102,15 +112,12 @@ DEFAULT_RL_CHECK_EVERY = _env_int("GH_RL_CHECK_EVERY", 50)
 DEFAULT_REPO_LIST_LIMIT = _env_int("REPO_LIST_LIMIT", 1000)
 
 
-# —————————————————————————
-# Dataclasses
-# —————————————————————————
-
 @dataclass
 class RateLimitState:
     call_count: int = 0
     remaining: int = 9999
     reset_epoch: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -130,15 +137,34 @@ class OrgStats:
     skipped_perm: int = 0
     skipped_existing: int = 0
     skipped_recent: int = 0
+    skipped_veracode_profile: int = 0
     created: int = 0
     skipped_no_issues: int = 0
     deleted: int = 0
     failed: int = 0
 
 
-# —————————————————————————
-# Validation
-# —————————————————————————
+@dataclass
+class RepoResult:
+    repo_name: str
+    row: dict
+    logs: list[str] = field(default_factory=list)
+    stat_deltas: dict[str, int] = field(default_factory=dict)
+
+
+class RepoLogger:
+    """Per-repo log buffer. Flushed atomically when the repo finishes."""
+
+    def __init__(self, repo_name: str) -> None:
+        self.repo_name = repo_name
+        self.lines: list[str] = []
+
+    def log(self, msg: str) -> None:
+        self.lines.append(msg)
+
+    def warn(self, msg: str) -> None:
+        self.lines.append(f"[WARN] {msg}")
+
 
 def build_gh_env(gh_hostname: str | None) -> dict[str, str]:
     env = os.environ.copy()
@@ -156,7 +182,6 @@ def validate_repo_name(repo: str) -> bool:
 
 
 def _load_lines(file_path: str, exc_cls: type[Exception], kind: str) -> list[str]:
-    """Shared loader for org/repo files."""
     if not os.path.isfile(file_path):
         raise exc_cls(f"{kind.capitalize()} file not found: {file_path}")
 
@@ -205,12 +230,7 @@ def filter_repos_by_wildcard(repos: list[dict], pattern: str) -> list[dict]:
     ]
 
 
-# —————————————————————————
-# Rate limiting
-# —————————————————————————
-
 def query_rate_limit(ctx: GhContext) -> bool:
-    """Query GitHub core REST rate limit. Updates ctx.state."""
     try:
         result = subprocess.run(
             ["gh", "api", "rate_limit", "--jq", ".resources.core.remaining, .resources.core.reset"],
@@ -223,36 +243,44 @@ def query_rate_limit(ctx: GhContext) -> bool:
         lines = result.stdout.strip().splitlines()
         if len(lines) < 2:
             return False
-        ctx.state.remaining = int(lines[0])
-        ctx.state.reset_epoch = int(lines[1])
+        with ctx.state.lock:
+            ctx.state.remaining = int(lines[0])
+            ctx.state.reset_epoch = int(lines[1])
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return False
 
 
 def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
-    ctx.state.call_count += 1
-    if ctx.state.call_count != 1 and ctx.state.call_count % ctx.check_every != 0:
+    with ctx.state.lock:
+        ctx.state.call_count += 1
+        should_check = (
+            ctx.state.call_count == 1
+            or ctx.state.call_count % ctx.check_every == 0
+        )
+
+    if not should_check:
         return
     if not query_rate_limit(ctx):
         return
-    if ctx.state.remaining <= ctx.min_remaining:
-        sleep_for = ctx.state.reset_epoch - int(time.time()) + 1
+
+    with ctx.state.lock:
+        remaining = ctx.state.remaining
+        reset_epoch = ctx.state.reset_epoch
+
+    if remaining <= ctx.min_remaining:
+        sleep_for = reset_epoch - int(time.time()) + 1
         if sleep_for > 0:
             reset_human = datetime.fromtimestamp(
-                ctx.state.reset_epoch, tz=timezone.utc
+                reset_epoch, tz=timezone.utc
             ).strftime("%Y-%m-%d %H:%M:%S UTC")
             print(
-                f"Core rate limit low (remaining={ctx.state.remaining}). "
+                f"Core rate limit low (remaining={remaining}). "
                 f"Sleeping ~{sleep_for}s until reset ({reset_human}).",
                 file=sys.stderr,
             )
             time.sleep(sleep_for)
 
-
-# —————————————————————————
-# Subprocess wrapper
-# —————————————————————————
 
 def _run_subprocess(
     args: list[str],
@@ -284,7 +312,6 @@ def gh_call(
     ctx: GhContext,
     timeout: int = SUBPROCESS_TIMEOUT,
 ) -> tuple[bool, str, str]:
-    """Run gh CLI with proactive + reactive rate limit handling and exponential backoff."""
     delay = SECONDARY_RATE_LIMIT_SLEEP
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
@@ -323,7 +350,9 @@ def gh_call(
             time.sleep(delay)
             delay = min(delay * 2, SECONDARY_BACKOFF_CAP)
         elif query_rate_limit(ctx):
-            sleep_for = max(ctx.state.reset_epoch - int(time.time()) + 1, 30)
+            with ctx.state.lock:
+                reset_epoch = ctx.state.reset_epoch
+            sleep_for = max(reset_epoch - int(time.time()) + 1, 30)
             print(f"Core rate limit. Sleeping {sleep_for}s until reset...", file=sys.stderr)
             time.sleep(sleep_for)
         else:
@@ -333,12 +362,7 @@ def gh_call(
     return False, "", ""
 
 
-# —————————————————————————
-# JSON helper
-# —————————————————————————
-
 def parse_json_safe(stdout: str, context: str = "") -> object | None:
-    """Parse JSON from subprocess stdout. Returns None on empty input or parse error."""
     stripped = stdout.strip()
     if not stripped:
         return None
@@ -349,9 +373,120 @@ def parse_json_safe(stdout: str, context: str = "") -> object | None:
         return None
 
 
-# —————————————————————————
-# GitHub API calls
-# —————————————————————————
+def fetch_veracode_profiles(region: str) -> set[str]:
+    try:
+        import requests
+        from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
+    except ImportError as exc:
+        raise VeracodeError(
+            "Missing Python packages. Install with: "
+            "pip install veracode-api-signing requests"
+        ) from exc
+
+    base_url = VERACODE_REGIONS.get(region)
+    if not base_url:
+        raise VeracodeError(f"Unknown Veracode region: {region!r}")
+
+    if not os.environ.get("VERACODE_API_KEY_ID") and not os.path.isfile(
+        os.path.expanduser("~/.veracode/credentials")
+    ):
+        raise VeracodeError(
+            "No Veracode credentials found. Set VERACODE_API_KEY_ID/"
+            "VERACODE_API_KEY_SECRET env vars or create ~/.veracode/credentials"
+        )
+
+    auth = RequestsAuthPluginVeracodeHMAC()
+    headers = {"User-Agent": "vcbaseline-trigger-script"}
+    profile_names: set[str] = set()
+    page = 0
+    total_pages: int | None = None
+
+    print(f"Fetching Veracode application profiles from {base_url}...")
+
+    while True:
+        url = f"{base_url}/applications"
+        params = {"page": page, "size": VERACODE_PAGE_SIZE}
+
+        last_exc: Exception | None = None
+        response = None
+        for attempt in range(1, VERACODE_MAX_RETRIES + 1):
+            try:
+                response = requests.get(
+                    url, auth=auth, headers=headers, params=params,
+                    timeout=VERACODE_TIMEOUT,
+                )
+                if response.status_code == 429 or response.status_code >= 500:
+                    print(
+                        f"  Veracode HTTP {response.status_code} on page {page} "
+                        f"(attempt {attempt}/{VERACODE_MAX_RETRIES}). Retrying...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(VERACODE_RETRY_SLEEP * attempt)
+                    continue
+                break
+            except requests.RequestException as exc:
+                last_exc = exc
+                print(
+                    f"  Veracode request error on page {page} "
+                    f"(attempt {attempt}/{VERACODE_MAX_RETRIES}): {exc}",
+                    file=sys.stderr,
+                )
+                time.sleep(VERACODE_RETRY_SLEEP * attempt)
+
+        if response is None:
+            raise VeracodeError(f"Veracode request failed after retries: {last_exc}")
+
+        if not response.ok:
+            raise VeracodeError(
+                f"Veracode API returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise VeracodeError(f"Failed to parse Veracode response: {exc}") from exc
+
+        embedded = data.get("_embedded") or {}
+        apps = embedded.get("applications") or []
+        for app in apps:
+            profile = app.get("profile") or {}
+            name = profile.get("name")
+            if name:
+                profile_names.add(name.strip().lower())
+
+        page_meta = data.get("page") or {}
+        if total_pages is None:
+            total_pages = page_meta.get("total_pages", 0)
+            total_elements = page_meta.get("total_elements", "?")
+            print(f"  Total profiles to fetch: {total_elements} across {total_pages} page(s)")
+
+        page += 1
+        if not apps or (total_pages is not None and page >= total_pages):
+            break
+
+    print(f"  Loaded {len(profile_names)} unique Veracode profile name(s).")
+    return profile_names
+
+
+def build_veracode_profile_name(repo_full_name: str) -> str:
+    return repo_full_name.strip().lower()
+
+
+def get_default_branch(repo: str, ctx: GhContext) -> str | None:
+    success, stdout, _ = gh_call(
+        [
+            "gh", "repo", "view", repo,
+            "--json", "defaultBranchRef",
+            "--jq", ".defaultBranchRef.name // \"\"",
+        ],
+        ctx,
+    )
+    if not success:
+        return None
+    branch = stdout.strip()
+    return branch if branch else None
+
 
 def check_org_access(org: str, ctx: GhContext) -> bool:
     success, _, _ = gh_call(["gh", "api", f"orgs/{org}", "--silent"], ctx)
@@ -366,14 +501,6 @@ def _check_and_report(org: str, ctx: GhContext) -> bool:
 
 
 def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
-    """Fetch repos for an org. Uses the longer REPO_LIST_TIMEOUT since
-    listing 1000+ repos can take well over 60s on large orgs.
-
-    Note: defaultBranchRef is intentionally NOT included here even though
-    it would be nice for --stale-days mode. Adding it to the bulk query
-    on a 1000+ repo org makes gh's GraphQL backend slow enough to time out.
-    Default branch is fetched per-repo only when needed.
-    """
     success, stdout, _ = gh_call(
         [
             "gh", "repo", "list", org,
@@ -391,24 +518,7 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
     return result if isinstance(result, list) else []
 
 
-def get_default_branch(repo: str, ctx: GhContext) -> str | None:
-    """Look up the default branch for a single repo. Used only by --stale-days mode."""
-    success, stdout, _ = gh_call(
-        [
-            "gh", "repo", "view", repo,
-            "--json", "defaultBranchRef",
-            "--jq", ".defaultBranchRef.name // \"\"",
-        ],
-        ctx,
-    )
-    if not success:
-        return None
-    branch = stdout.strip()
-    return branch if branch else None
-
-
 def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
-    """Find open issues by exact title match."""
     success, stdout, _ = gh_call(
         [
             "gh", "issue", "list",
@@ -428,7 +538,6 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
 
 
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
-    """Get most recent Veracode check completion. Branch is passed in to avoid extra API call."""
     if not branch:
         return None
 
@@ -470,13 +579,9 @@ def calculate_days_since(dt: datetime | None) -> int | None:
     return (datetime.now(timezone.utc) - dt).days
 
 
-# —————————————————————————
-# CSV row builders
-# —————————————————————————
-
 CREATE_FIELDNAMES = [
     "org", "repo", "primary_language", "issues_enabled", "is_archived",
-    "last_check_date", "days_since_check", "action",
+    "veracode_profile_exists", "last_check_date", "days_since_check", "action",
 ]
 
 DELETE_FIELDNAMES = [
@@ -488,6 +593,7 @@ def _row_create(
     org: str,
     repo: dict,
     action: str,
+    veracode_profile_exists: str = "",
     last_check_date: str = "",
     days_since_check: str = "",
 ) -> dict:
@@ -497,6 +603,7 @@ def _row_create(
         "primary_language": repo["primaryLanguage"],
         "issues_enabled": repo["hasIssuesEnabled"],
         "is_archived": repo["isArchived"],
+        "veracode_profile_exists": veracode_profile_exists,
         "last_check_date": last_check_date,
         "days_since_check": days_since_check,
         "action": action,
@@ -514,77 +621,275 @@ def _row_delete(org: str, repo: dict, issues_deleted: int, action: str) -> dict:
     }
 
 
-def _write_row(
+def _process_delete_repo(org: str, repo: dict, ctx: GhContext) -> RepoResult:
+    name = repo["nameWithOwner"]
+    log = RepoLogger(name)
+    deltas: dict[str, int] = {"total_repos": 1}
+
+    if repo["isArchived"]:
+        deltas["archived"] = 1
+        log.log("Repository is archived. Skipping.")
+        return RepoResult(name, _row_delete(org, repo, 0, "skipped_archived"), log.lines, deltas)
+
+    issue_numbers = find_open_issues(name, ISSUE_TITLE, ctx)
+    if issue_numbers is None:
+        log.log("Could not query issues (API error). Skipping.")
+        deltas["failed"] = 1
+        return RepoResult(name, _row_delete(org, repo, 0, "failed_query_issues"), log.lines, deltas)
+
+    if not issue_numbers:
+        log.log("No matching issues found.")
+        deltas["skipped_no_issues"] = 1
+        return RepoResult(name, _row_delete(org, repo, 0, "no_issues_found"), log.lines, deltas)
+
+    issues_deleted = issues_failed = 0
+    for issue_num in issue_numbers:
+        log.log(f"Closing issue #{issue_num}...")
+        success, _, _ = gh_call(
+            [
+                "gh", "issue", "close", str(issue_num), "--repo", name,
+                "--comment", "Closed by cleanup script",
+            ],
+            ctx,
+        )
+        if success:
+            issues_deleted += 1
+            deltas["deleted"] = deltas.get("deleted", 0) + 1
+            time.sleep(WRITE_THROTTLE_SECONDS)
+        else:
+            log.log(f"Failed to close issue #{issue_num}")
+            issues_failed += 1
+            deltas["failed"] = deltas.get("failed", 0) + 1
+
+    action = "partial_delete" if issues_failed > 0 else "deleted"
+    return RepoResult(name, _row_delete(org, repo, issues_deleted, action), log.lines, deltas)
+
+
+def _restore_issues_disabled(name: str, ctx: GhContext, log: RepoLogger) -> bool:
+    log.log("Restoring state: Disabling issues...")
+    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
+    if not success:
+        log.warn(f"Failed to restore issues-disabled state on {name}")
+    return success
+
+
+def _process_create_repo(
+    org: str,
+    repo: dict,
+    ctx: GhContext,
+    stale_days: int | None,
+    veracode_profiles: set[str] | None,
+) -> RepoResult:
+    name = repo["nameWithOwner"]
+    issues_enabled = repo["hasIssuesEnabled"]
+    primary_lang = repo["primaryLanguage"]
+    is_archived = repo["isArchived"]
+
+    log = RepoLogger(name)
+    deltas: dict[str, int] = {"total_repos": 1}
+
+    last_check_date = ""
+    days_since_check = ""
+    vc_exists_str = ""
+
+    check_stale = stale_days is not None and stale_days > 0
+    check_veracode = veracode_profiles is not None
+
+    if is_archived:
+        deltas["archived"] = 1
+        log.log("Repository is archived. Skipping.")
+        return RepoResult(
+            name, _row_create(org, repo, "skipped_archived"), log.lines, deltas,
+        )
+
+    if primary_lang in IAC_LANGUAGES:
+        deltas["iac"] = 1
+
+    if check_veracode:
+        expected_profile = build_veracode_profile_name(name)
+        profile_exists = expected_profile in veracode_profiles
+        vc_exists_str = "true" if profile_exists else "false"
+        if profile_exists:
+            log.log(f"Veracode profile '{name}' already exists on platform. Skipping.")
+            deltas["skipped_veracode_profile"] = 1
+            return RepoResult(
+                name,
+                _row_create(org, repo, "skipped_veracode_profile_exists", vc_exists_str),
+                log.lines, deltas,
+            )
+
+    if check_stale:
+        log.log(f"Checking for Veracode checks in the last {stale_days} days...")
+        default_branch = get_default_branch(name, ctx)
+        last_check = get_last_veracode_check(name, default_branch or "", ctx)
+        days_since = calculate_days_since(last_check)
+
+        if last_check:
+            last_check_date = last_check.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if days_since is not None:
+            days_since_check = str(days_since)
+
+        if last_check and days_since is not None and days_since < stale_days:
+            log.log(f"Recent Veracode check found ({days_since} days ago). Skipping.")
+            deltas["skipped_recent"] = 1
+            return RepoResult(
+                name,
+                _row_create(
+                    org, repo, "skipped_recent_check",
+                    vc_exists_str, last_check_date, days_since_check,
+                ),
+                log.lines, deltas,
+            )
+
+        if last_check:
+            log.log(f"Last Veracode check was {days_since} days ago. Proceeding.")
+        else:
+            log.log("No Veracode checks found. Proceeding.")
+
+    was_disabled = False
+    if not issues_enabled:
+        log.log("Issues are disabled. Temporarily enabling...")
+        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx)
+        if not success:
+            log.log("Could not enable issues. Skipping issue creation.")
+            deltas["skipped_perm"] = 1
+            return RepoResult(
+                name,
+                _row_create(
+                    org, repo, "skipped_cant_enable_issues",
+                    vc_exists_str, last_check_date, days_since_check,
+                ),
+                log.lines, deltas,
+            )
+        was_disabled = True
+
+    existing_issues = find_open_issues(name, ISSUE_TITLE, ctx)
+
+    if existing_issues is None:
+        log.log("Could not query existing issues (API error). Skipping to avoid duplicates.")
+        deltas["failed"] = 1
+        if was_disabled:
+            _restore_issues_disabled(name, ctx, log)
+        return RepoResult(
+            name,
+            _row_create(
+                org, repo, "failed_query_issues",
+                vc_exists_str, last_check_date, days_since_check,
+            ),
+            log.lines, deltas,
+        )
+
+    if existing_issues:
+        log.log("Open issue with same title already exists. Skipping.")
+        deltas["skipped_existing"] = 1
+        if was_disabled:
+            _restore_issues_disabled(name, ctx, log)
+        return RepoResult(
+            name,
+            _row_create(
+                org, repo, "skipped_existing_issue",
+                vc_exists_str, last_check_date, days_since_check,
+            ),
+            log.lines, deltas,
+        )
+
+    log.log("Creating issue...")
+    success, _, _ = gh_call(
+        [
+            "gh", "issue", "create", "--repo", name,
+            "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
+        ],
+        ctx,
+    )
+
+    if success:
+        deltas["created"] = 1
+        action = "created"
+        time.sleep(WRITE_THROTTLE_SECONDS)
+    else:
+        log.log("Failed to create issue.")
+        deltas["failed"] = 1
+        action = "failed_create"
+
+    if was_disabled:
+        if not _restore_issues_disabled(name, ctx, log):
+            action = f"{action}_restore_failed"
+
+    return RepoResult(
+        name,
+        _row_create(
+            org, repo, action,
+            vc_exists_str, last_check_date, days_since_check,
+        ),
+        log.lines, deltas,
+    )
+
+
+def _apply_deltas(stats: OrgStats, deltas: dict[str, int]) -> None:
+    for key, value in deltas.items():
+        setattr(stats, key, getattr(stats, key) + value)
+
+
+def _drive_workers(
+    org: str,
+    repos: list[dict],
     csv_writer: csv.DictWriter,
     csv_file: io.TextIOWrapper,
-    row: dict,
-    flush: bool = True,
-) -> None:
-    csv_writer.writerow(row)
-    if flush:
-        csv_file.flush()
+    csv_lock: threading.Lock,
+    workers: int,
+    worker_fn,
+) -> OrgStats:
+    """Run worker_fn across repos with ThreadPoolExecutor. Aggregate stats and
+    flush per-repo logs atomically as each future completes."""
+    stats = OrgStats(org=org)
+    total = len(repos)
+    completed = 0
 
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_repo = {executor.submit(worker_fn, repo): repo for repo in repos}
 
-# —————————————————————————
-# Mode: delete
-# —————————————————————————
+        for future in as_completed(future_to_repo):
+            repo = future_to_repo[future]
+            completed += 1
+            repo_name = repo["nameWithOwner"]
+
+            try:
+                result: RepoResult = future.result()
+            except Exception as exc:
+                print(
+                    f"\n[{completed}/{total}] {repo_name}\n"
+                    f"  WORKER CRASHED: {exc}",
+                    file=sys.stderr,
+                )
+                stats.failed += 1
+                continue
+
+            block = [f"\n[{completed}/{total}] {result.repo_name}"]
+            block.extend(f"  {line}" for line in result.logs)
+            print("\n".join(block))
+
+            _apply_deltas(stats, result.stat_deltas)
+
+            with csv_lock:
+                csv_writer.writerow(result.row)
+                csv_file.flush()
+
+    return stats
+
 
 def run_delete_mode(
     org: str,
     repos: list[dict],
     csv_writer: csv.DictWriter,
     csv_file: io.TextIOWrapper,
+    csv_lock: threading.Lock,
     ctx: GhContext,
+    workers: int,
 ) -> OrgStats:
-    stats = OrgStats(org=org)
+    def worker(repo: dict) -> RepoResult:
+        return _process_delete_repo(org, repo, ctx)
 
-    for repo in repos:
-        name = repo["nameWithOwner"]
-        is_archived = repo["isArchived"]
-        print("-------------------------------------------")
-        print(f"Processing {name}")
-        stats.total_repos += 1
-
-        if is_archived:
-            stats.archived += 1
-            print("Repository is archived. Skipping.")
-            _write_row(csv_writer, csv_file, _row_delete(org, repo, 0, "skipped_archived"))
-            continue
-
-        issue_numbers = find_open_issues(name, ISSUE_TITLE, ctx)
-        if issue_numbers is None:
-            print("Could not query issues (API error). Skipping.")
-            stats.failed += 1
-            _write_row(csv_writer, csv_file, _row_delete(org, repo, 0, "failed_query_issues"))
-            continue
-
-        if not issue_numbers:
-            print("No matching issues found.")
-            stats.skipped_no_issues += 1
-            _write_row(csv_writer, csv_file, _row_delete(org, repo, 0, "no_issues_found"))
-            continue
-
-        issues_deleted = issues_failed = 0
-        for issue_num in issue_numbers:
-            print(f"Closing issue #{issue_num}...")
-            success, _, _ = gh_call(
-                [
-                    "gh", "issue", "close", str(issue_num), "--repo", name,
-                    "--comment", "Closed by cleanup script",
-                ],
-                ctx,
-            )
-            if success:
-                issues_deleted += 1
-                stats.deleted += 1
-                time.sleep(WRITE_THROTTLE_SECONDS)
-            else:
-                print(f"Failed to close issue #{issue_num}")
-                issues_failed += 1
-                stats.failed += 1
-
-        action = "partial_delete" if issues_failed > 0 else "deleted"
-        _write_row(csv_writer, csv_file, _row_delete(org, repo, issues_deleted, action))
+    stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
 
     print(f"\nFinished closing issues for org: {org}\n")
     print(f"Delete Stats for Organization: {org}")
@@ -599,170 +904,23 @@ def run_delete_mode(
     return stats
 
 
-# —————————————————————————
-# Mode: create
-# —————————————————————————
-
-def _restore_issues_disabled(name: str, ctx: GhContext) -> bool:
-    """Re-disable issues. Returns True on success."""
-    print("Restoring state: Disabling issues...")
-    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
-    if not success:
-        print(f"Warning: failed to restore issues-disabled state on {name}", file=sys.stderr)
-    return success
-
-
 def run_create_mode(
     org: str,
     repos: list[dict],
     csv_writer: csv.DictWriter,
     csv_file: io.TextIOWrapper,
+    csv_lock: threading.Lock,
     ctx: GhContext,
     stale_days: int | None,
+    veracode_profiles: set[str] | None,
+    workers: int,
 ) -> OrgStats:
-    stats = OrgStats(org=org)
-    check_stale = stale_days is not None and stale_days > 0
+    check_veracode = veracode_profiles is not None
 
-    for repo in repos:
-        name = repo["nameWithOwner"]
-        issues_enabled = repo["hasIssuesEnabled"]
-        primary_lang = repo["primaryLanguage"]
-        is_archived = repo["isArchived"]
+    def worker(repo: dict) -> RepoResult:
+        return _process_create_repo(org, repo, ctx, stale_days, veracode_profiles)
 
-        print("-------------------------------------------")
-        print(f"Processing {name}")
-        stats.total_repos += 1
-
-        last_check_date = ""
-        days_since_check = ""
-
-        if is_archived:
-            stats.archived += 1
-            print("Repository is archived. Skipping.")
-            _write_row(csv_writer, csv_file, _row_create(org, repo, "skipped_archived"))
-            continue
-
-        if primary_lang in IAC_LANGUAGES:
-            stats.iac += 1
-
-        if check_stale:
-            print(f"Checking for Veracode checks in the last {stale_days} days...")
-            default_branch = get_default_branch(name, ctx)
-            last_check = get_last_veracode_check(name, default_branch or "", ctx)
-            days_since = calculate_days_since(last_check)
-
-            if last_check:
-                last_check_date = last_check.strftime("%Y-%m-%d %H:%M:%S UTC")
-            if days_since is not None:
-                days_since_check = str(days_since)
-
-            if last_check and days_since is not None and days_since < stale_days:
-                print(f"Recent Veracode check found ({days_since} days ago). Skipping.")
-                stats.skipped_recent += 1
-                _write_row(
-                    csv_writer,
-                    csv_file,
-                    _row_create(
-                        org,
-                        repo,
-                        "skipped_recent_check",
-                        last_check_date,
-                        days_since_check,
-                    ),
-                )
-                continue
-
-            if last_check:
-                print(f"Last Veracode check was {days_since} days ago. Proceeding.")
-            else:
-                print("No Veracode checks found. Proceeding.")
-
-        was_disabled = False
-        if not issues_enabled:
-            print("Issues are disabled. Temporarily enabling...")
-            success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx)
-            if not success:
-                print("Could not enable issues. Skipping issue creation.")
-                stats.skipped_perm += 1
-                _write_row(
-                    csv_writer,
-                    csv_file,
-                    _row_create(
-                        org,
-                        repo,
-                        "skipped_cant_enable_issues",
-                        last_check_date,
-                        days_since_check,
-                    ),
-                )
-                continue
-            was_disabled = True
-
-        existing_issues = find_open_issues(name, ISSUE_TITLE, ctx)
-
-        if existing_issues is None:
-            print("Could not query existing issues (API error). Skipping to avoid duplicates.")
-            stats.failed += 1
-            if was_disabled:
-                _restore_issues_disabled(name, ctx)
-            _write_row(
-                csv_writer,
-                csv_file,
-                _row_create(
-                    org,
-                    repo,
-                    "failed_query_issues",
-                    last_check_date,
-                    days_since_check,
-                ),
-            )
-            continue
-
-        if existing_issues:
-            print("Open issue with same title already exists. Skipping.")
-            stats.skipped_existing += 1
-            if was_disabled:
-                _restore_issues_disabled(name, ctx)
-            _write_row(
-                csv_writer,
-                csv_file,
-                _row_create(
-                    org,
-                    repo,
-                    "skipped_existing_issue",
-                    last_check_date,
-                    days_since_check,
-                ),
-            )
-            continue
-
-        print("Creating issue...")
-        success, _, _ = gh_call(
-            [
-                "gh", "issue", "create", "--repo", name,
-                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
-            ],
-            ctx,
-        )
-
-        if success:
-            stats.created += 1
-            action = "created"
-            time.sleep(WRITE_THROTTLE_SECONDS)
-        else:
-            print("Failed to create issue.")
-            stats.failed += 1
-            action = "failed_create"
-
-        if was_disabled:
-            if not _restore_issues_disabled(name, ctx):
-                action = f"{action}_restore_failed"
-
-        _write_row(
-            csv_writer,
-            csv_file,
-            _row_create(org, repo, action, last_check_date, days_since_check),
-        )
+    stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
 
     print(f"\nFinished processing all repositories for org: {org}\n")
     print(f"Repository Stats for Organization: {org}")
@@ -772,6 +930,8 @@ def run_create_mode(
     print(f"IaC Repositories:         {stats.iac} (Primary language: HCL/Bicep)")
     print(f"Issues Permission Skips:  {stats.skipped_perm}")
     print(f"Skipped Existing Issues:  {stats.skipped_existing}")
+    if check_veracode:
+        print(f"Skipped VC Profile Hits:  {stats.skipped_veracode_profile}")
     if stale_days:
         print(f"Skipped Recent Checks:    {stats.skipped_recent} (scanned within {stale_days} days)")
     print(f"Created Issues:           {stats.created}")
@@ -780,10 +940,6 @@ def run_create_mode(
 
     return stats
 
-
-# —————————————————————————
-# Summary
-# —————————————————————————
 
 def print_org_header(org: str, org_index: int, total_orgs: int) -> None:
     if total_orgs > 1:
@@ -796,6 +952,7 @@ def print_multi_org_summary(
     all_stats: list[OrgStats],
     delete_mode: bool,
     stale_days: int | None,
+    check_veracode: bool,
     output_file: str,
 ) -> None:
     print(f"\n{'=' * 64}")
@@ -821,6 +978,8 @@ def print_multi_org_summary(
             ("Skipped", ">8", lambda s: s.skipped_existing),
             ("PermSkip", ">9", lambda s: s.skipped_perm),
         ]
+        if check_veracode:
+            cols.append(("VCProf", ">7", lambda s: s.skipped_veracode_profile))
         if stale_days:
             cols.append(("Recent", ">7", lambda s: s.skipped_recent))
         cols.append(("IaC", ">5", lambda s: s.iac))
@@ -841,10 +1000,6 @@ def print_multi_org_summary(
     print(f"\nCSV Output: {output_file}")
     print(f"{'=' * 64}")
 
-
-# —————————————————————————
-# Main
-# —————————————————————————
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -881,6 +1036,33 @@ def main() -> None:
         default=None,
         help=f"Only create issues for repos not scanned in last N days (suggested: {DEFAULT_STALE_DAYS})",
     )
+    parser.add_argument(
+        "--veracode-skip-existing",
+        action="store_true",
+        help=(
+            "Query the Veracode platform and skip repos that already have an "
+            "application profile (named '<org>/<repo>'). Requires "
+            "VERACODE_API_KEY_ID/VERACODE_API_KEY_SECRET env vars or "
+            "~/.veracode/credentials."
+        ),
+    )
+    parser.add_argument(
+        "--veracode-region",
+        choices=sorted(VERACODE_REGIONS.keys()),
+        default="commercial",
+        help="Veracode region for the API base URL (default: commercial)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        metavar="N",
+        help=(
+            f"Parallel worker threads per org (default: {DEFAULT_WORKERS}, "
+            f"max: {MAX_WORKERS}). Higher values are faster but increase risk "
+            f"of GitHub secondary rate limits."
+        ),
+    )
     parser.add_argument("--hostname", metavar="HOSTNAME", default=None, help="GitHub hostname for GHES/GHEC")
     parser.add_argument(
         "--output",
@@ -915,8 +1097,14 @@ def main() -> None:
         sys.exit("Error: --min-remaining must be >= 0")
     if args.stale_days is not None and args.stale_days < 0:
         sys.exit("Error: --stale-days must be >= 0")
+    if args.workers < 1:
+        sys.exit("Error: --workers must be >= 1")
+    if args.workers > MAX_WORKERS:
+        sys.exit(f"Error: --workers must be <= {MAX_WORKERS}")
     if args.delete and args.stale_days is not None:
         print("Warning: --stale-days is ignored in delete mode.", file=sys.stderr)
+    if args.delete and args.veracode_skip_existing:
+        print("Warning: --veracode-skip-existing is ignored in delete mode.", file=sys.stderr)
 
     if shutil.which("gh") is None:
         sys.exit("Error: GitHub CLI (gh) is not installed.")
@@ -965,6 +1153,14 @@ def main() -> None:
 
     total_orgs = len(orgs)
 
+    veracode_profiles: set[str] | None = None
+    use_veracode = args.veracode_skip_existing and not args.delete
+    if use_veracode:
+        try:
+            veracode_profiles = fetch_veracode_profiles(args.veracode_region)
+        except VeracodeError as exc:
+            sys.exit(f"Error: Veracode profile fetch failed: {exc}")
+
     print("\nChecking access to all organizations...")
     inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx)]
     if inaccessible_orgs:
@@ -973,6 +1169,8 @@ def main() -> None:
             "Fix access or remove them and retry."
         )
     print()
+
+    print(f"Using {args.workers} parallel worker(s) per org.")
 
     if args.delete:
         print("================================================================")
@@ -985,9 +1183,14 @@ def main() -> None:
             print("================================================================")
             print(f"STALE CHECK MODE: Creating issues for repos not scanned in {args.stale_days} days")
             print("================================================================\n")
+        if use_veracode:
+            print("================================================================")
+            print(f"VERACODE SKIP MODE: Skipping repos with existing profiles ({args.veracode_region})")
+            print("================================================================\n")
 
     output_file = args.output
     all_stats: list[OrgStats] = []
+    csv_lock = threading.Lock()
 
     if os.path.exists(output_file):
         print(f"Warning: '{output_file}' already exists and will be overwritten.", file=sys.stderr)
@@ -1021,9 +1224,14 @@ def main() -> None:
                     continue
 
                 if args.delete:
-                    stats = run_delete_mode(org, repos, csv_writer, csv_file, ctx)
+                    stats = run_delete_mode(
+                        org, repos, csv_writer, csv_file, csv_lock, ctx, args.workers,
+                    )
                 else:
-                    stats = run_create_mode(org, repos, csv_writer, csv_file, ctx, args.stale_days)
+                    stats = run_create_mode(
+                        org, repos, csv_writer, csv_file, csv_lock, ctx,
+                        args.stale_days, veracode_profiles, args.workers,
+                    )
 
                 all_stats.append(stats)
 
@@ -1032,7 +1240,9 @@ def main() -> None:
         sys.exit(130)
 
     if total_orgs > 1 and all_stats:
-        print_multi_org_summary(all_stats, args.delete, args.stale_days, output_file)
+        print_multi_org_summary(
+            all_stats, args.delete, args.stale_days, use_veracode, output_file,
+        )
 
     print(f"\nCSV Output: {output_file}")
 

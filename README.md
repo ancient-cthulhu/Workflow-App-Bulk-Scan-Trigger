@@ -1,6 +1,6 @@
 # Veracode Workflow App - Issue Scan Trigger Script
 
-Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, stale scan detection, repo filtering, and multi-org runs with a CSV audit trail.
+Creates or closes GitHub issues across repositories in one or more GitHub organizations to trigger Veracode scans via the Veracode Workflow App. Handles archived repos, temporarily disabled Issues, duplicate prevention, rate limiting, stale scan detection, repo filtering, Veracode profile existence check, parallel processing, and multi-org runs with a CSV audit trail.
 
 ---
 
@@ -10,12 +10,15 @@ For each repository in the target organization, the script:
 
 1. Skips archived repositories
 2. Optionally filters repos by name list (`--repo-file`) or wildcard pattern (`--repo-wildcard`)
-3. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
-4. Temporarily enables Issues if disabled (restores original state after)
-5. Checks for an existing open trigger issue to avoid duplicates
-6. Creates the trigger issue
-7. Writes a per-repo result row to the CSV audit trail
-8. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
+3. Optionally skips repos that already have a Veracode application profile on the platform (`--veracode-skip-existing`)
+4. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
+5. Temporarily enables Issues if disabled (restores original state after)
+6. Checks for an existing open trigger issue to avoid duplicates
+7. Creates the trigger issue
+8. Writes a per-repo result row to the CSV audit trail
+9. Proactively checks GitHub API rate limits and sleeps until reset if limits are low
+
+Repos within an org are processed in parallel by a configurable thread pool (`--workers`). Each repo is one atomic work unit so the enable-issues / create-issue / restore-issues sequence stays consistent per repo while different repos run concurrently.
 
 > **Scans are not triggered directly.** The issue acts as a signal to the Veracode Workflow App, which initiates scans based on the `veracode.yml` configuration in each repository. If `issues.trigger` is not set to `true` in `veracode.yml`, no scan will start.
 
@@ -56,11 +59,25 @@ python script.py --stale-days 30 my-github-org
 python script.py --stale-days 30 --org-file orgs.txt
 ```
 
+### Skip repos that already have a Veracode application profile
+
+```bash
+python script.py --veracode-skip-existing my-github-org
+python script.py --veracode-skip-existing --veracode-region eu --org-file orgs.txt
+```
+
+### Run faster with more parallel workers
+
+```bash
+python script.py --workers 10 my-github-org
+python script.py --workers 20 --stale-days 30 --org-file orgs.txt
+```
+
 ### Clean up trigger issues
 
 ```bash
 python script.py --delete my-github-org
-python script.py --delete --org-file orgs.txt
+python script.py --delete --workers 10 --org-file orgs.txt
 ```
 
 ---
@@ -72,7 +89,11 @@ gh --version    # GitHub CLI v2+
 python --version  # Python 3.10+
 ```
 
-No additional dependencies - stdlib only.
+Stdlib only by default. `--veracode-skip-existing` additionally requires:
+
+```bash
+pip install veracode-api-signing requests
+```
 
 ---
 
@@ -96,12 +117,32 @@ export GH_ENTERPRISE_TOKEN=ghp_yourtoken
 
 When using `--hostname`, the script injects `GH_HOST` into every `gh` call automatically, no need to export it in your shell. The script warns if `--hostname` points to a GHES instance but `GH_ENTERPRISE_TOKEN` is not set.
 
+### Veracode (only required with `--veracode-skip-existing`)
+
+Set either environment variables:
+
+```bash
+export VERACODE_API_KEY_ID=your_api_id
+export VERACODE_API_KEY_SECRET=your_api_secret
+```
+
+Or a credentials file at `~/.veracode/credentials`:
+
+```ini
+[default]
+veracode_api_key_id = your_api_id
+veracode_api_key_secret = your_api_secret
+```
+
+The API account needs read access to the Applications API (Security Lead, Reviewer, or Creator role).
+
 ### Required Permissions
 
 | Operation | Required |
 |-----------|----------|
 | Create / delete issues | Read access + permission to create issues |
 | Enable Issues on repos where disabled | Admin permission on those repos |
+| Query Veracode profiles | Veracode API account with read access to Applications |
 
 If Issues cannot be enabled on a repository, the script skips it and records the reason in the CSV.
 
@@ -133,6 +174,9 @@ The command value must exactly match the Workflow App command name. This mismatc
 | `--repo-wildcard PATTERN` | Filter repos using wildcard pattern. Case-insensitive. Mutually exclusive with `--repo-file`. See [Repo Filtering](#repo-filtering) for pattern syntax. |
 | `--delete` | Close previously created trigger issues instead of creating new ones |
 | `--stale-days N` | Only create issues for repos not scanned in the last N days. Checks for Veracode check runs (SAST, SCA, IaC). Disabled by default. Set to 0 to disable. Ignored in delete mode. |
+| `--veracode-skip-existing` | Query the Veracode platform once at startup and skip repos that already have an application profile named `<org>/<repo>` (case-insensitive). Ignored in delete mode. See [Veracode Profile Skip](#veracode-profile-skip). |
+| `--veracode-region {commercial,eu,federal}` | Veracode region for the API base URL (default: `commercial`). |
+| `--workers N` | Parallel worker threads per org (default: `5`, max: `50`). Higher values are faster but increase risk of GitHub secondary rate limits. See [Parallel Processing](#parallel-processing). |
 | `--hostname HOSTNAME` | GitHub hostname. Omit for github.com. GHES: `github.mycompany.com`. GHEC: `myorg.ghe.com`. Sets `GH_HOST` per-call without modifying your shell. |
 | `--output FILE` | CSV output path (default: `vcbaseline.csv`) |
 | `--repo-limit N` | Max repos to fetch per org (default: `1000`) |
@@ -140,6 +184,66 @@ The command value must exactly match the Workflow App command name. This mismatc
 | `--rl-check-every N` | Check rate limit every N gh calls (default: `50`) |
 
 Environment variables `GH_RL_MIN_REMAINING`, `GH_RL_CHECK_EVERY`, and `REPO_LIST_LIMIT` set the same defaults as their flag equivalents. Flags take precedence.
+
+---
+
+## Parallel Processing
+
+The script processes repos within an org in parallel using a thread pool. Each repo is one atomic work unit, so the enable-issues / create / restore sequence on a single repo stays serialized while different repos run concurrently.
+
+```bash
+# Default: 5 workers per org
+python script.py my-github-org
+
+# Faster: 10 workers
+python script.py --workers 10 my-github-org
+
+# Aggressive: 20 workers (watch for secondary rate limits)
+python script.py --workers 20 --org-file orgs.txt
+```
+
+### Choosing a worker count
+
+| Workers | Use case |
+|---------|----------|
+| `1` | Sequential (legacy behavior, easiest to debug) |
+| `3-5` | Conservative default. Safe for write-heavy runs (creating many issues) |
+| `8-15` | Balanced. Good for typical runs of a few hundred repos |
+| `20-30` | Read-heavy runs. Best when most repos are skipped (e.g. `--stale-days`, `--veracode-skip-existing`) |
+| `30-50` | Very large orgs where most repos hit a fast skip path |
+
+Each worker is a thread that runs `gh` subprocesses. Threads release the GIL during subprocess I/O so this scales well for I/O-bound work.
+
+### Output ordering
+
+Per-repo log lines are buffered and printed as one contiguous block when each repo finishes, prefixed `[N/total] org/repo`. Blocks appear in completion order, not submission order. This keeps each repo's output readable even with many workers in flight.
+
+### Rate limit interaction
+
+Higher worker counts can trip GitHub's secondary rate limits on bursty write operations (issue creation/closure). The script has multiple mitigations:
+
+- A 1 second throttle per worker after each issue write (so N workers produce roughly N writes/sec sustained)
+- Automatic exponential backoff and retry on secondary rate limit responses
+- Proactive Core API rate limit checks shared across all workers
+
+If you see "Secondary rate limit" warnings in stderr, lower `--workers` or tighten proactive limits:
+
+```bash
+python script.py --workers 15 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+```
+
+### Expected speedup
+
+For a 100-repo org with ~3 API calls per repo at ~1s latency each:
+
+| Workers | Approximate time |
+|---------|------------------|
+| 1 | ~5 minutes |
+| 5 | ~1 minute |
+| 10 | ~30 seconds |
+| 20 | ~15 seconds |
+
+Actual speedup depends on API latency and how many repos hit fast skip paths.
 
 ---
 
@@ -197,11 +301,11 @@ Matching is case-insensitive. The pattern applies to the repo name only (not the
 
 ### Combining with Other Filters
 
-Repo filters can be combined with `--stale-days`:
+Repo filters can be combined with `--stale-days`, `--veracode-skip-existing`, and `--workers`:
 
 ```bash
-# Only api-* repos not scanned in 30 days
-python script.py --repo-wildcard "api-*" --stale-days 30 my-github-org
+# Only api-* repos not scanned in 30 days, skipping those with existing VC profiles, 10 workers
+python script.py --repo-wildcard "api-*" --stale-days 30 --veracode-skip-existing --workers 10 my-github-org
 ```
 
 Repo filters also work with `--delete`:
@@ -210,6 +314,29 @@ Repo filters also work with `--delete`:
 # Close issues only on specific repos
 python script.py --delete --repo-file repos.txt my-github-org
 ```
+
+---
+
+## Veracode Profile Skip
+
+Use `--veracode-skip-existing` to query the Veracode platform once at startup and skip any repo that already has a matching application profile. This is useful when the Workflow App auto-creates profiles named `<org>/<repo>` and you only want to trigger scans for repos without an existing profile.
+
+```bash
+# Default (US Commercial region)
+python script.py --veracode-skip-existing my-github-org
+
+# EU region
+python script.py --veracode-skip-existing --veracode-region eu my-github-org
+
+# US Federal region
+python script.py --veracode-skip-existing --veracode-region federal --org-file orgs.txt
+```
+
+The script fetches all application profiles paginated from `appsec/v1/applications`, builds an in-memory set of lowercased profile names, then for each repo checks whether `<org>/<repo>` (lowercase) is present. The check runs before any GitHub issue mutation, so repos with existing profiles are recorded in the CSV as `skipped_veracode_profile_exists` without toggling Issues on.
+
+**Fail-safe behavior:** If the Veracode API is unreachable or returns an unrecoverable error after retries, the script aborts before making any GitHub changes. This prevents accidentally triggering scans for repos that may already have profiles.
+
+> **API cost note:** One Veracode API call per 500 profiles at startup. The lookup itself is in-memory and adds no extra API cost per repo, so it pairs well with high `--workers` counts.
 
 ---
 
@@ -232,23 +359,25 @@ python script.py --stale-days 0 my-github-org
 
 Repos with no Veracode check history are treated as stale and will have issues created.
 
-> **API cost note:** When `--stale-days` is set, the script makes one additional API call per repo to query Veracode check runs on the default branch. The default branch is fetched alongside the initial repo list, so no extra round-trip is needed to discover it.
+> **API cost note:** When `--stale-days` is set, the script makes one additional API call per repo to query Veracode check runs on the default branch. These per-repo calls run in parallel under `--workers`, so the overhead scales sub-linearly with repo count.
 
 ---
 
 ## Rate Limit Handling
 
-The script handles three failure modes automatically:
+The script handles four failure modes automatically:
 
-- **Core REST limits**: sleeps until the rate-limit reset epoch and retries.
+- **Core REST limits**: sleeps until the rate-limit reset epoch and retries. Rate limit state is shared across all worker threads and protected by a lock.
+- **Secondary rate limits / abuse detection**: exponential backoff per worker, retried up to 3 times.
 - **Auth failures** (bad credentials, 404, insufficient permissions): not retried; reported immediately and recorded in the CSV.
+- **Veracode 429 / 5xx**: retried with backoff during profile fetch at startup; aborts the run after retries are exhausted.
 
-Between content-creation calls (issue create / close), a 1 second throttle is applied to reduce secondary rate limit risk on bursty operations.
+Between content-creation calls (issue create / close), a 1 second throttle is applied per worker to reduce secondary rate limit risk on bursty operations.
 
-To reduce risk further on large runs, tighten the proactive thresholds:
+To reduce risk further on large runs with many workers, tighten the proactive thresholds:
 
 ```bash
-python script.py --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+python script.py --workers 20 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
 ```
 
 Rate limit pauses are logged to stderr so the CSV output stays clean.
@@ -290,17 +419,17 @@ For orgs with more than 1,000 repos, raise `--repo-limit`:
 python script.py --repo-limit 5000 my-github-org
 ```
 
-For very large orgs, tighten rate limit controls:
+For very large orgs, combine parallel workers with tighter rate limit controls:
 
 ```bash
-python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+python script.py --repo-limit 10000 --workers 15 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
 ```
 
 ---
 
 ## Output
 
-`vcbaseline.csv` is written to the working directory after every run (override with `--output`). One row per repository. In multi-org runs all orgs land in the same file, filter by the `org` column to isolate results per organization.
+`vcbaseline.csv` is written to the working directory after every run (override with `--output`). One row per repository. In multi-org runs all orgs land in the same file, filter by the `org` column to isolate results per organization. CSV writes are serialized across worker threads so output is consistent even at high `--workers` counts. Row order in the file reflects completion order, not the original repo order.
 
 #### Create Mode
 
@@ -311,6 +440,7 @@ python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --or
 | `primary_language` | Repository primary language, or `N/A` |
 | `issues_enabled` | Whether Issues were enabled before the run |
 | `is_archived` | Whether the repository is archived |
+| `veracode_profile_exists` | `true` / `false` if `--veracode-skip-existing` is used, empty otherwise |
 | `last_check_date` | Timestamp of most recent Veracode check run (empty if none found or `--stale-days` not used) |
 | `days_since_check` | Days since the last Veracode check (empty if none found or `--stale-days` not used) |
 | `action` | Outcome - see values below |
@@ -319,6 +449,7 @@ python script.py --repo-limit 10000 --min-remaining 200 --rl-check-every 25 --or
 |----------------|---------|
 | `created` | Issue created successfully |
 | `created_restore_failed` | Issue created, but failed to restore the original issues-disabled state on the repo. The repo now has Issues enabled when it previously did not - manual cleanup may be required. |
+| `skipped_veracode_profile_exists` | Application profile already exists on the Veracode platform (only when `--veracode-skip-existing` is used) |
 | `skipped_recent_check` | Veracode check found within `--stale-days` threshold |
 | `skipped_existing_issue` | Open trigger issue already exists |
 | `skipped_archived` | Repository is archived, skipped |
@@ -363,10 +494,19 @@ To re-trigger scans:
 ## Troubleshooting
 
 - **"API rate limit exceeded / HTTP 403 / secondary rate limit / submitted too quickly"**
-  - Handled automatically. See [Rate Limit Handling](#rate-limit-handling) for the exact retry behavior. To reduce risk on large runs:
+  - Handled automatically. See [Rate Limit Handling](#rate-limit-handling) for the exact retry behavior. If you see frequent secondary rate limit warnings, lower `--workers`:
     ```bash
-    python script.py --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
+    python script.py --workers 3 --min-remaining 200 --rl-check-every 25 --org-file orgs.txt
     ```
+
+- **Run feels slow even with multiple workers**
+  - If most of your work is issue creation (write-heavy), each worker is throttled 1 second after each write. For read-heavy runs (`--delete`, `--stale-days`, `--veracode-skip-existing`) you can safely raise workers higher.
+
+- **Interleaved or out-of-order log output**
+  - Expected with parallelism. Each repo's output is grouped together as a contiguous `[N/total] org/repo` block, but blocks appear in completion order. Use `--workers 1` if you need strict sequential output for debugging.
+
+- **"WORKER CRASHED" message in stderr**
+  - An unhandled exception in one repo's processing. The error is logged, that repo is counted as `failed`, and the rest of the run continues. Re-run for just that repo with `--repo-file` to debug.
 
 - **"Cannot access the following org(s)" on startup**
   - Check for typos in the org name or file, or confirm your token has access to all listed orgs. No changes are made until access is confirmed for all orgs.
@@ -391,6 +531,9 @@ To re-trigger scans:
 
 - **`created_restore_failed` or `failed_create_restore_failed` rows in the CSV**
   - The script temporarily enabled Issues on a repo, then could not re-disable them afterward. The repo now has Issues enabled when it previously did not. Filter the CSV for these actions and manually disable Issues if needed.
+
+- **"Veracode profile fetch failed" on startup**
+  - Confirm `VERACODE_API_KEY_ID`/`VERACODE_API_KEY_SECRET` are set or `~/.veracode/credentials` exists, the API account has read access to the Applications API, and `--veracode-region` matches your account's region. Install dependencies with `pip install veracode-api-signing requests`.
 
 - **"SyntaxError" or unexpected failures**
   - Requires Python 3.10 or newer. Check with `python --version`.

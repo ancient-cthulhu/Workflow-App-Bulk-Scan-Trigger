@@ -621,8 +621,17 @@ def _row_delete(org: str, repo: dict, issues_deleted: int, action: str) -> dict:
     }
 
 
+def _restore_issues_disabled(name: str, ctx: GhContext, log: RepoLogger) -> bool:
+    log.log("Restoring state: Disabling issues...")
+    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
+    if not success:
+        log.warn(f"Failed to restore issues-disabled state on {name}")
+    return success
+
+
 def _process_delete_repo(org: str, repo: dict, ctx: GhContext) -> RepoResult:
     name = repo["nameWithOwner"]
+    issues_enabled = repo["hasIssuesEnabled"]
     log = RepoLogger(name)
     deltas: dict[str, int] = {"total_repos": 1}
 
@@ -631,15 +640,31 @@ def _process_delete_repo(org: str, repo: dict, ctx: GhContext) -> RepoResult:
         log.log("Repository is archived. Skipping.")
         return RepoResult(name, _row_delete(org, repo, 0, "skipped_archived"), log.lines, deltas)
 
+    was_disabled = False
+    if not issues_enabled:
+        log.log("Issues are disabled. Temporarily enabling to close existing issue...")
+        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx)
+        if not success:
+            log.log("Could not enable issues. Skipping.")
+            deltas["failed"] = 1
+            return RepoResult(
+                name, _row_delete(org, repo, 0, "failed_enable_issues"), log.lines, deltas,
+            )
+        was_disabled = True
+
     issue_numbers = find_open_issues(name, ISSUE_TITLE, ctx)
     if issue_numbers is None:
         log.log("Could not query issues (API error). Skipping.")
         deltas["failed"] = 1
+        if was_disabled:
+            _restore_issues_disabled(name, ctx, log)
         return RepoResult(name, _row_delete(org, repo, 0, "failed_query_issues"), log.lines, deltas)
 
     if not issue_numbers:
         log.log("No matching issues found.")
         deltas["skipped_no_issues"] = 1
+        if was_disabled:
+            _restore_issues_disabled(name, ctx, log)
         return RepoResult(name, _row_delete(org, repo, 0, "no_issues_found"), log.lines, deltas)
 
     issues_deleted = issues_failed = 0
@@ -662,15 +687,12 @@ def _process_delete_repo(org: str, repo: dict, ctx: GhContext) -> RepoResult:
             deltas["failed"] = deltas.get("failed", 0) + 1
 
     action = "partial_delete" if issues_failed > 0 else "deleted"
+
+    if was_disabled:
+        if not _restore_issues_disabled(name, ctx, log):
+            action = f"{action}_restore_failed"
+
     return RepoResult(name, _row_delete(org, repo, issues_deleted, action), log.lines, deltas)
-
-
-def _restore_issues_disabled(name: str, ctx: GhContext, log: RepoLogger) -> bool:
-    log.log("Restoring state: Disabling issues...")
-    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
-    if not success:
-        log.warn(f"Failed to restore issues-disabled state on {name}")
-    return success
 
 
 def _process_create_repo(

@@ -11,12 +11,14 @@ import fnmatch
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,7 +30,6 @@ SUBPROCESS_TIMEOUT = 60
 REPO_LIST_TIMEOUT = 300
 DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
 DEFAULT_STALE_DAYS = 30
-WRITE_THROTTLE_SECONDS = 1.0
 SECONDARY_RATE_LIMIT_SLEEP = 60
 SECONDARY_BACKOFF_CAP = 600
 MAX_RATE_LIMIT_RETRIES = 3
@@ -48,13 +49,15 @@ VERACODE_RETRY_SLEEP = 5
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
 _VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9.*-]+$")
+_RETRY_AFTER_RE = re.compile(r"(?:retry[- ]after|wait)[:\s]+(\d+)", re.IGNORECASE)
 
 _REPO_JQ = (
     "[.[] | {"
     "nameWithOwner: .nameWithOwner, "
     "hasIssuesEnabled: .hasIssuesEnabled, "
     "primaryLanguage: (.primaryLanguage.name // \"N/A\"), "
-    "isArchived: .isArchived"
+    "isArchived: .isArchived, "
+    "defaultBranch: (.defaultBranchRef.name // \"\")"
     "}]"
 )
 
@@ -107,9 +110,87 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-DEFAULT_RL_MIN_REMAINING = _env_int("GH_RL_MIN_REMAINING", 100)
-DEFAULT_RL_CHECK_EVERY = _env_int("GH_RL_CHECK_EVERY", 50)
+CORE_MIN_REMAINING = _env_int("GH_RL_MIN_REMAINING", 100)
+CORE_CHECK_EVERY = _env_int("GH_RL_CHECK_EVERY", 50)
 DEFAULT_REPO_LIST_LIMIT = _env_int("REPO_LIST_LIMIT", 1000)
+
+GH_POINTS_PER_MIN = _env_int("GH_POINTS_PER_MIN", 700)
+GH_CONTENT_PER_MIN = _env_int("GH_CONTENT_PER_MIN", 60)
+GH_CONTENT_PER_HOUR = _env_int("GH_CONTENT_PER_HOUR", 450)
+
+
+@dataclass(frozen=True)
+class CallCost:
+    points: int
+    content: bool
+
+
+COST_READ = CallCost(points=1, content=False)
+COST_WRITE = CallCost(points=5, content=False)
+COST_CONTENT = CallCost(points=5, content=True)
+
+
+class Throttle:
+    """Shared across all worker threads. Paces every gh call against GitHub's
+    secondary rate limits: combined points/minute, content/minute, content/hour,
+    plus a global back-off window so a single secondary-limit hit stalls every
+    thread instead of all of them retrying at once."""
+
+    def __init__(
+        self,
+        points_per_min: int,
+        content_per_min: int,
+        content_per_hour: int,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._points: deque[tuple[float, int]] = deque()
+        self._content_min: deque[float] = deque()
+        self._content_hour: deque[float] = deque()
+        self._pause_until = 0.0
+        self.points_per_min = points_per_min
+        self.content_per_min = content_per_min
+        self.content_per_hour = content_per_hour
+
+    @staticmethod
+    def _prune(dq: deque, now: float, period: float, key=lambda e: e) -> None:
+        cutoff = now - period
+        while dq and key(dq[0]) <= cutoff:
+            dq.popleft()
+
+    def register_block(self, seconds: float) -> None:
+        with self._lock:
+            self._pause_until = max(self._pause_until, time.monotonic() + seconds)
+
+    def acquire(self, cost: CallCost) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                wait = 0.0
+
+                if self._pause_until > now:
+                    wait = self._pause_until - now
+                else:
+                    self._prune(self._points, now, 60.0, key=lambda e: e[0])
+                    used = sum(p for _, p in self._points)
+                    if used + cost.points > self.points_per_min and self._points:
+                        wait = max(wait, self._points[0][0] + 60.0 - now)
+
+                    if cost.content:
+                        self._prune(self._content_min, now, 60.0)
+                        self._prune(self._content_hour, now, 3600.0)
+                        if len(self._content_min) + 1 > self.content_per_min and self._content_min:
+                            wait = max(wait, self._content_min[0] + 60.0 - now)
+                        if len(self._content_hour) + 1 > self.content_per_hour and self._content_hour:
+                            wait = max(wait, self._content_hour[0] + 3600.0 - now)
+
+                    if wait <= 0:
+                        self._points.append((now, cost.points))
+                        if cost.content:
+                            self._content_min.append(now)
+                            self._content_hour.append(now)
+                        return
+
+            time.sleep(min(wait, 5.0) + random.uniform(0.0, 0.15))
 
 
 @dataclass
@@ -124,8 +205,9 @@ class RateLimitState:
 class GhContext:
     env: dict[str, str]
     state: RateLimitState
-    min_remaining: int
-    check_every: int
+    throttle: Throttle
+    min_remaining: int = CORE_MIN_REMAINING
+    check_every: int = CORE_CHECK_EVERY
 
 
 @dataclass
@@ -307,15 +389,27 @@ def _run_subprocess(
         return False, "", "timeout"
 
 
+def _parse_retry_after(text: str) -> int | None:
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def gh_call(
     args: list[str],
     ctx: GhContext,
+    cost: CallCost = COST_READ,
     timeout: int = SUBPROCESS_TIMEOUT,
 ) -> tuple[bool, str, str]:
     delay = SECONDARY_RATE_LIMIT_SLEEP
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         maybe_pause_for_rate_limit(ctx)
+        ctx.throttle.acquire(cost)
         success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
 
         if success:
@@ -340,23 +434,29 @@ def gh_call(
             print(stderr, file=sys.stderr)
             return False, stdout, stderr
 
+        retry_after = _parse_retry_after(combined)
         is_secondary = any(pat in combined for pat in _SECONDARY_RATE_LIMIT_PATTERNS)
-        if is_secondary:
+
+        if is_secondary or retry_after is not None:
+            block_for = retry_after if retry_after is not None else delay
             print(
                 f"Secondary rate limit (attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES}). "
-                f"Sleeping {delay}s...",
+                f"Pausing all workers {block_for}s...",
                 file=sys.stderr,
             )
-            time.sleep(delay)
+            ctx.throttle.register_block(block_for)
+            time.sleep(block_for)
             delay = min(delay * 2, SECONDARY_BACKOFF_CAP)
         elif query_rate_limit(ctx):
             with ctx.state.lock:
                 reset_epoch = ctx.state.reset_epoch
             sleep_for = max(reset_epoch - int(time.time()) + 1, 30)
-            print(f"Core rate limit. Sleeping {sleep_for}s until reset...", file=sys.stderr)
+            print(f"Core rate limit. Pausing all workers {sleep_for}s until reset...", file=sys.stderr)
+            ctx.throttle.register_block(sleep_for)
             time.sleep(sleep_for)
         else:
-            print("Rate limited (could not query reset). Sleeping 30s...", file=sys.stderr)
+            print("Rate limited (could not query reset). Pausing all workers 30s...", file=sys.stderr)
+            ctx.throttle.register_block(30)
             time.sleep(30)
 
     return False, "", ""
@@ -473,23 +573,8 @@ def build_veracode_profile_name(repo_full_name: str) -> str:
     return repo_full_name.strip().lower()
 
 
-def get_default_branch(repo: str, ctx: GhContext) -> str | None:
-    success, stdout, _ = gh_call(
-        [
-            "gh", "repo", "view", repo,
-            "--json", "defaultBranchRef",
-            "--jq", ".defaultBranchRef.name // \"\"",
-        ],
-        ctx,
-    )
-    if not success:
-        return None
-    branch = stdout.strip()
-    return branch if branch else None
-
-
 def check_org_access(org: str, ctx: GhContext) -> bool:
-    success, _, _ = gh_call(["gh", "api", f"orgs/{org}", "--silent"], ctx)
+    success, _, _ = gh_call(["gh", "api", f"orgs/{org}", "--silent"], ctx, cost=COST_READ)
     return success
 
 
@@ -505,10 +590,11 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
         [
             "gh", "repo", "list", org,
             "--limit", str(limit),
-            "--json", "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived",
+            "--json", "nameWithOwner,hasIssuesEnabled,primaryLanguage,isArchived,defaultBranchRef",
             "--jq", _REPO_JQ,
         ],
         ctx,
+        cost=COST_READ,
         timeout=REPO_LIST_TIMEOUT,
     )
     if not success:
@@ -528,6 +614,7 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
             "--json", "number,title",
         ],
         ctx,
+        cost=COST_READ,
     )
     if not success:
         return None
@@ -548,6 +635,7 @@ def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime 
             "-f", "per_page=100",
         ],
         ctx,
+        cost=COST_READ,
     )
     if not success:
         return None
@@ -631,7 +719,7 @@ def _row_delete(
 
 def _restore_issues_disabled(name: str, ctx: GhContext, log: RepoLogger) -> bool:
     log.log("Restoring state: Disabling issues...")
-    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx)
+    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx, cost=COST_WRITE)
     if not success:
         log.warn(f"Failed to restore issues-disabled state on {name}")
     return success
@@ -674,7 +762,7 @@ def _process_delete_repo(
     was_disabled = False
     if not issues_enabled:
         log.log("Issues are disabled. Temporarily enabling to close existing issue...")
-        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx)
+        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx, cost=COST_WRITE)
         if not success:
             log.log("Could not enable issues. Skipping.")
             deltas["failed"] = 1
@@ -717,11 +805,11 @@ def _process_delete_repo(
                 "--comment", "Closed by cleanup script",
             ],
             ctx,
+            cost=COST_CONTENT,
         )
         if success:
             issues_deleted += 1
             deltas["deleted"] = deltas.get("deleted", 0) + 1
-            time.sleep(WRITE_THROTTLE_SECONDS)
         else:
             log.log(f"Failed to close issue #{issue_num}")
             issues_failed += 1
@@ -787,8 +875,8 @@ def _process_create_repo(
 
     if check_stale:
         log.log(f"Checking for Veracode checks in the last {stale_days} days...")
-        default_branch = get_default_branch(name, ctx)
-        last_check = get_last_veracode_check(name, default_branch or "", ctx)
+        default_branch = repo.get("defaultBranch") or ""
+        last_check = get_last_veracode_check(name, default_branch, ctx)
         days_since = calculate_days_since(last_check)
 
         if last_check:
@@ -816,7 +904,7 @@ def _process_create_repo(
     was_disabled = False
     if not issues_enabled:
         log.log("Issues are disabled. Temporarily enabling...")
-        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx)
+        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx, cost=COST_WRITE)
         if not success:
             log.log("Could not enable issues. Skipping issue creation.")
             deltas["skipped_perm"] = 1
@@ -867,12 +955,12 @@ def _process_create_repo(
             "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
         ],
         ctx,
+        cost=COST_CONTENT,
     )
 
     if success:
         deltas["created"] = 1
         action = "created"
-        time.sleep(WRITE_THROTTLE_SECONDS)
     else:
         log.log("Failed to create issue.")
         deltas["failed"] = 1
@@ -1135,8 +1223,8 @@ def main() -> None:
         metavar="N",
         help=(
             f"Parallel worker threads per org (default: {DEFAULT_WORKERS}, "
-            f"max: {MAX_WORKERS}). Higher values are faster but increase risk "
-            f"of GitHub secondary rate limits."
+            f"max: {MAX_WORKERS}). All workers share one rate-limit throttle, "
+            f"so higher values speed up reads without risking secondary limits."
         ),
     )
     parser.add_argument("--hostname", metavar="HOSTNAME", default=None, help="GitHub hostname for GHES/GHEC")
@@ -1152,25 +1240,9 @@ def main() -> None:
         default=DEFAULT_REPO_LIST_LIMIT,
         help=f"Max repos per org (default: {DEFAULT_REPO_LIST_LIMIT})",
     )
-    parser.add_argument(
-        "--min-remaining",
-        type=int,
-        default=DEFAULT_RL_MIN_REMAINING,
-        help=f"Pause when core remaining <= N (default: {DEFAULT_RL_MIN_REMAINING})",
-    )
-    parser.add_argument(
-        "--rl-check-every",
-        type=int,
-        default=DEFAULT_RL_CHECK_EVERY,
-        help=f"Check rate limit every N gh calls (default: {DEFAULT_RL_CHECK_EVERY})",
-    )
 
     args = parser.parse_args()
 
-    if args.rl_check_every < 1:
-        sys.exit("Error: --rl-check-every must be >= 1")
-    if args.min_remaining < 0:
-        sys.exit("Error: --min-remaining must be >= 0")
     if args.stale_days is not None and args.stale_days < 0:
         sys.exit("Error: --stale-days must be >= 0")
     if args.workers < 1:
@@ -1193,11 +1265,16 @@ def main() -> None:
     if gh_hostname:
         print(f"Targeting GitHub host: {gh_hostname}")
 
+    throttle = Throttle(
+        points_per_min=GH_POINTS_PER_MIN,
+        content_per_min=GH_CONTENT_PER_MIN,
+        content_per_hour=GH_CONTENT_PER_HOUR,
+    )
+
     ctx = GhContext(
         env=build_gh_env(gh_hostname),
         state=RateLimitState(),
-        min_remaining=args.min_remaining,
-        check_every=args.rl_check_every,
+        throttle=throttle,
     )
 
     repo_filter_names: list[str] | None = None
@@ -1245,6 +1322,11 @@ def main() -> None:
     print()
 
     print(f"Using {args.workers} parallel worker(s) per org.")
+    print(
+        f"Rate-limit throttle: <= {GH_POINTS_PER_MIN} points/min, "
+        f"<= {GH_CONTENT_PER_MIN} content writes/min, "
+        f"<= {GH_CONTENT_PER_HOUR} content writes/hour (shared across all workers)."
+    )
 
     if args.delete:
         print("================================================================")

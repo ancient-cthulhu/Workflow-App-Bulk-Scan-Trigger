@@ -9,7 +9,7 @@ Creates or closes GitHub issues across repositories in one or more GitHub organi
 For each repository in the target organization, the script:
 
 1. Skips archived repositories
-2. Optionally filters repos by name list (`--repo-file`) or wildcard pattern (`--repo-wildcard`)
+2. Optionally filters repos by org/repo combination (`--org-repo-file`), name list (`--repo-file`), or wildcard pattern (`--repo-wildcard`)
 3. Optionally skips repos that already have a Veracode application profile on the platform (`--veracode-skip-existing`)
 4. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
 5. Temporarily enables Issues if disabled (restores original state after)
@@ -36,6 +36,12 @@ python script.py my-github-org
 
 ```bash
 python script.py --org-file orgs.txt
+```
+
+### Target specific org/repo combinations
+
+```bash
+python script.py --org-repo-file org_repos.csv
 ```
 
 ### Target specific repos by name
@@ -169,9 +175,10 @@ The command value must exactly match the Workflow App command name. This mismatc
 | Flag | Description |
 |------|-------------|
 | `org` | Single org name (positional argument) |
-| `--org-file FILE` | Path to a text file with one org per line. `#` lines and blank lines are ignored. Mutually exclusive with the positional org argument. |
-| `--repo-file FILE` | Path to a text file with one repo name per line (without org prefix). `#` lines and blank lines are ignored. Mutually exclusive with `--repo-wildcard`. |
-| `--repo-wildcard PATTERN` | Filter repos using wildcard pattern. Case-insensitive. Mutually exclusive with `--repo-file`. See [Repo Filtering](#repo-filtering) for pattern syntax. |
+| `--org-file FILE` | Path to a text file with one org per line. `#` lines and blank lines are ignored. Mutually exclusive with the positional org argument and `--org-repo-file`. |
+| `--org-repo-file FILE` | Path to a CSV file with 2 columns: `org` and `repo`. Supports quoted values. Triggers scans for the specified org/repo combinations only. `#` lines and blank lines are ignored. Mutually exclusive with the positional org argument and `--org-file`. See [Org-Repo Filtering](#org-repo-filtering) for details. |
+| `--repo-file FILE` | Path to a text file with one repo name per line (without org prefix). `#` lines and blank lines are ignored. Mutually exclusive with `--repo-wildcard` and `--org-repo-file`. |
+| `--repo-wildcard PATTERN` | Filter repos using wildcard pattern. Case-insensitive. Mutually exclusive with `--repo-file` and `--org-repo-file`. See [Repo Filtering](#repo-filtering) for pattern syntax. |
 | `--delete` | Close previously created trigger issues instead of creating new ones |
 | `--stale-days N` | Only create issues for repos not scanned in the last N days. Checks for Veracode check runs (SAST, SCA, IaC). Disabled by default. Set to 0 to disable. Ignored in delete mode. |
 | `--veracode-skip-existing` | Query the Veracode platform once at startup and skip repos that already have an application profile named `<org>/<repo>` (case-insensitive). Ignored in delete mode. See [Veracode Profile Skip](#veracode-profile-skip). |
@@ -313,6 +320,53 @@ Repo filters also work with `--delete`:
 ```bash
 # Close issues only on specific repos
 python script.py --delete --repo-file repos.txt my-github-org
+```
+
+---
+
+## Org-Repo Filtering
+
+Use `--org-repo-file` to target specific org/repo combinations without having to create separate `--repo-file` lists per org. This is useful when you want to run issues across multiple orgs but only on a specific subset of repositories in each organization.
+
+### Filter by Org-Repo Combination (`--org-repo-file`)
+
+Create a CSV file with 2 columns: `org` and `repo`. Supports quoted values for clarity:
+
+```csv
+# org_repos.csv
+# Comments start with #
+my-org,api-service
+my-org,frontend-app
+other-org,backend-api
+other-org,shared-lib
+third-org,core-lib
+```
+
+With quoted values:
+
+```csv
+"my-org","api-service"
+"my-org","frontend-app"
+"other-org","backend-api"
+```
+
+```bash
+python script.py --org-repo-file org_repos.csv
+```
+
+Matching is case-insensitive. Lines starting with `#` and blank lines are ignored. The file uses Python's CSV reader with quote support, so you can safely include special characters by quoting the value.
+
+Org-repo filters can be combined with `--stale-days`, `--veracode-skip-existing`, `--workers`, and `--delete`:
+
+```bash
+# Only specified org/repo combinations not scanned in 30 days, 10 workers
+python script.py --org-repo-file org_repos.csv --stale-days 30 --workers 10
+
+# Skip repos with existing VC profiles
+python script.py --org-repo-file org_repos.csv --veracode-skip-existing
+
+# Close issues only on specified org/repo combinations
+python script.py --delete --org-repo-file org_repos.csv
 ```
 
 ---
@@ -516,6 +570,18 @@ To re-trigger scans:
 
 - **"No repo names found" when using --repo-file**
   - Every line is blank or starts with `#`. Add at least one uncommented repo name.
+
+- **"Expected 2 columns (org, repo)" when using --org-repo-file**
+  - The CSV file has the wrong number of columns. Each line must have exactly 2 columns separated by a comma. Lines with fewer or more columns are an error. Ensure the file format is correct.
+
+- **"org and repo cannot be empty" when using --org-repo-file**
+  - One of the columns is empty or contains only whitespace. Ensure both org and repo values are provided and non-empty.
+
+- **"Invalid org name: ..." when using --org-repo-file**
+  - Org names must start and end with a letter or digit, contain only alphanumeric characters and hyphens between them, and be at most 39 characters. Check the org name in your CSV file.
+
+- **"Invalid repo name: ..." when using --org-repo-file**
+  - Repo names must contain only alphanumeric characters, hyphens, underscores, and periods. Check the repo name in your CSV file.
 
 - **"Invalid org name(s)" when using --org-file or a positional org**
   - Org names must start and end with a letter or digit, contain only alphanumeric characters and hyphens between them, and be at most 39 characters.

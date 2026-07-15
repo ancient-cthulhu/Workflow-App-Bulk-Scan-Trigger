@@ -37,6 +37,15 @@ PARTIAL_STDERR_LIMIT = 500
 DEFAULT_WORKERS = 5
 MAX_WORKERS = 50
 
+# GitHub asks for at least 1s between mutative requests.
+MUTATION_MIN_GAP = 1.0
+# Global minimum gap between issue creations. GitHub's issue-creation limit is
+# undisclosed and fails silently, so this is deliberately conservative.
+DEFAULT_CREATE_INTERVAL = 25.0
+DEFAULT_BATCH_PAUSE = 900.0
+INFLIGHT_POLL_SECONDS = 60
+VERIFY_DELAY_SECONDS = 3
+
 VERACODE_REGIONS = {
     "commercial": "https://api.veracode.com/appsec/v1",
     "eu": "https://api.veracode.eu/appsec/v1",
@@ -48,7 +57,7 @@ VERACODE_MAX_RETRIES = 3
 VERACODE_RETRY_SLEEP = 5
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
-_VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9.*-]+$")
+_VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9._*?\[\]-]+$")
 _RETRY_AFTER_RE = re.compile(r"(?:retry[- ]after|wait)[:\s]+(\d+)", re.IGNORECASE)
 
 _REPO_JQ = (
@@ -59,6 +68,11 @@ _REPO_JQ = (
     "isArchived: .isArchived, "
     "defaultBranch: (.defaultBranchRef.name // \"\")"
     "}]"
+)
+
+_RL_JQ = (
+    "[.resources.core.remaining, .resources.core.reset, "
+    "(.resources.graphql.remaining // 9999), (.resources.graphql.reset // 0)] | .[]"
 )
 
 _RATE_LIMIT_PATTERNS = (
@@ -81,6 +95,19 @@ _AUTH_FAILURE_PATTERNS = (
     "resource not accessible",
     "bad credentials",
     "requires authentication",
+)
+
+# GraphQL can return HTTP 200 with an error body when rate limited, so exit code
+# alone is not enough. These appear in stdout on a "successful" call.
+_SILENT_ERROR_PATTERNS = (
+    "api rate limit exceeded",
+    "was submitted too quickly",
+    "secondary rate limit",
+    "\"errors\":",
+)
+
+_ACTIVE_RUN_STATES = frozenset(
+    {"queued", "in_progress", "waiting", "requested", "pending"}
 )
 
 
@@ -115,41 +142,52 @@ CORE_CHECK_EVERY = _env_int("GH_RL_CHECK_EVERY", 50)
 DEFAULT_REPO_LIST_LIMIT = _env_int("REPO_LIST_LIMIT", 1000)
 
 GH_POINTS_PER_MIN = _env_int("GH_POINTS_PER_MIN", 700)
-GH_CONTENT_PER_MIN = _env_int("GH_CONTENT_PER_MIN", 60)
-GH_CONTENT_PER_HOUR = _env_int("GH_CONTENT_PER_HOUR", 450)
+GH_CONTENT_PER_MIN = _env_int("GH_CONTENT_PER_MIN", 20)
+GH_CONTENT_PER_HOUR = _env_int("GH_CONTENT_PER_HOUR", 140)
+GH_SEARCH_PER_MIN = _env_int("GH_SEARCH_PER_MIN", 25)
 
 
 @dataclass(frozen=True)
 class CallCost:
     points: int
-    content: bool
+    content: bool = False
+    mutation: bool = False
+    search: bool = False
 
 
-COST_READ = CallCost(points=1, content=False)
-COST_WRITE = CallCost(points=5, content=False)
-COST_CONTENT = CallCost(points=5, content=True)
+COST_READ = CallCost(points=1)
+COST_SEARCH = CallCost(points=1, search=True)
+COST_WRITE = CallCost(points=5, mutation=True)
+COST_CONTENT = CallCost(points=5, content=True, mutation=True)
+# close + comment is two content operations in one gh call
+COST_CLOSE = CallCost(points=10, content=True, mutation=True)
 
 
 class Throttle:
     """Shared across all worker threads. Paces every gh call against GitHub's
     secondary rate limits: combined points/minute, content/minute, content/hour,
-    plus a global back-off window so a single secondary-limit hit stalls every
-    thread instead of all of them retrying at once."""
+    search/minute, a minimum gap between mutations, plus a global back-off window
+    so a single secondary-limit hit stalls every thread instead of all of them
+    retrying at once."""
 
     def __init__(
         self,
         points_per_min: int,
         content_per_min: int,
         content_per_hour: int,
+        search_per_min: int = GH_SEARCH_PER_MIN,
     ) -> None:
         self._lock = threading.Lock()
         self._points: deque[tuple[float, int]] = deque()
         self._content_min: deque[float] = deque()
         self._content_hour: deque[float] = deque()
+        self._search_min: deque[float] = deque()
+        self._last_mutation = 0.0
         self._pause_until = 0.0
         self.points_per_min = points_per_min
         self.content_per_min = content_per_min
         self.content_per_hour = content_per_hour
+        self.search_per_min = search_per_min
 
     @staticmethod
     def _prune(dq: deque, now: float, period: float, key=lambda e: e) -> None:
@@ -175,6 +213,16 @@ class Throttle:
                     if used + cost.points > self.points_per_min and self._points:
                         wait = max(wait, self._points[0][0] + 60.0 - now)
 
+                    if cost.mutation:
+                        gap = MUTATION_MIN_GAP - (now - self._last_mutation)
+                        if gap > 0:
+                            wait = max(wait, gap)
+
+                    if cost.search:
+                        self._prune(self._search_min, now, 60.0)
+                        if len(self._search_min) + 1 > self.search_per_min and self._search_min:
+                            wait = max(wait, self._search_min[0] + 60.0 - now)
+
                     if cost.content:
                         self._prune(self._content_min, now, 60.0)
                         self._prune(self._content_hour, now, 3600.0)
@@ -185,6 +233,10 @@ class Throttle:
 
                     if wait <= 0:
                         self._points.append((now, cost.points))
+                        if cost.mutation:
+                            self._last_mutation = now
+                        if cost.search:
+                            self._search_min.append(now)
                         if cost.content:
                             self._content_min.append(now)
                             self._content_hour.append(now)
@@ -193,11 +245,110 @@ class Throttle:
             time.sleep(min(wait, 5.0) + random.uniform(0.0, 0.15))
 
 
+class CreateGate:
+    """Serialises issue creation across every worker and every org: a minimum gap
+    between creations plus an optional batch pause. This is what stops the
+    Workflow App from queueing hundreds of scans at once."""
+
+    def __init__(
+        self,
+        interval: float,
+        batch_size: int = 0,
+        batch_pause: float = 0.0,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._count = 0
+        self.interval = interval
+        self.batch_size = batch_size
+        self.batch_pause = batch_pause
+
+    def wait(self, log: "RepoLogger") -> None:
+        # Lock is deliberately held across the sleep: creations must be serial.
+        with self._lock:
+            gap = self.interval - (time.monotonic() - self._last)
+            if gap > 0:
+                time.sleep(gap + random.uniform(0.0, 0.5))
+            self._count += 1
+            if self.batch_size and self._count % self.batch_size == 0:
+                log.log(
+                    f"Batch of {self.batch_size} issued. "
+                    f"Draining {self.batch_pause:.0f}s before the next batch."
+                )
+                time.sleep(self.batch_pause)
+            self._last = time.monotonic()
+
+
+class InflightTracker:
+    """Caps how many triggered scans may be queued or running at once. Without
+    this, a bulk run queues more Actions jobs than the org can execute, and jobs
+    age out past the 6h job / GITHUB_TOKEN lifetime and fail."""
+
+    def __init__(
+        self,
+        cap: int,
+        ctx: "GhContext",
+        poll_seconds: int = INFLIGHT_POLL_SECONDS,
+    ) -> None:
+        self.cap = cap
+        self.ctx = ctx
+        self.poll_seconds = poll_seconds
+        self._lock = threading.Lock()
+        self._pending: set[str] = set()
+
+    def _still_running(self, repo: str) -> bool:
+        ok, out, _ = gh_call(
+            [
+                "gh", "api", f"repos/{repo}/actions/runs",
+                "-X", "GET",
+                "-f", "event=issues",
+                "-f", "per_page=10",
+            ],
+            self.ctx,
+            cost=COST_READ,
+        )
+        if not ok:
+            return False
+        data = parse_json_safe(out, f"actions_runs repo={repo}")
+        if not isinstance(data, dict):
+            return False
+        return any(
+            run.get("status") in _ACTIVE_RUN_STATES
+            for run in (data.get("workflow_runs") or [])
+        )
+
+    def wait_for_slot(self, log: "RepoLogger") -> None:
+        if self.cap <= 0:
+            return
+        while True:
+            with self._lock:
+                pending = list(self._pending)
+            if len(pending) < self.cap:
+                return
+            finished = [r for r in pending if not self._still_running(r)]
+            with self._lock:
+                self._pending.difference_update(finished)
+                remaining = len(self._pending)
+            if remaining < self.cap:
+                return
+            log.log(
+                f"{remaining} scan(s) in flight (cap {self.cap}). "
+                f"Waiting {self.poll_seconds}s."
+            )
+            time.sleep(self.poll_seconds)
+
+    def add(self, repo: str) -> None:
+        if self.cap > 0:
+            with self._lock:
+                self._pending.add(repo)
+
+
 @dataclass
 class RateLimitState:
     call_count: int = 0
     remaining: int = 9999
     reset_epoch: int = 0
+    bucket: str = "core"
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -313,9 +464,11 @@ def filter_repos_by_wildcard(repos: list[dict], pattern: str) -> list[dict]:
 
 
 def query_rate_limit(ctx: GhContext) -> bool:
+    """Reads BOTH the core and graphql buckets. gh uses GraphQL for repo list,
+    issue list and repo edit, so watching core alone never fires."""
     try:
         result = subprocess.run(
-            ["gh", "api", "rate_limit", "--jq", ".resources.core.remaining, .resources.core.reset"],
+            ["gh", "api", "rate_limit", "--jq", _RL_JQ],
             capture_output=True,
             text=True,
             check=True,
@@ -323,11 +476,18 @@ def query_rate_limit(ctx: GhContext) -> bool:
             timeout=SUBPROCESS_TIMEOUT,
         )
         lines = result.stdout.strip().splitlines()
-        if len(lines) < 2:
+        if len(lines) < 4:
             return False
+        core_rem, core_reset, gql_rem, gql_reset = (int(x) for x in lines[:4])
         with ctx.state.lock:
-            ctx.state.remaining = int(lines[0])
-            ctx.state.reset_epoch = int(lines[1])
+            if core_rem <= gql_rem:
+                ctx.state.remaining = core_rem
+                ctx.state.reset_epoch = core_reset
+                ctx.state.bucket = "core"
+            else:
+                ctx.state.remaining = gql_rem
+                ctx.state.reset_epoch = gql_reset
+                ctx.state.bucket = "graphql"
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return False
@@ -349,6 +509,7 @@ def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
     with ctx.state.lock:
         remaining = ctx.state.remaining
         reset_epoch = ctx.state.reset_epoch
+        bucket = ctx.state.bucket
 
     if remaining <= ctx.min_remaining:
         sleep_for = reset_epoch - int(time.time()) + 1
@@ -357,10 +518,11 @@ def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
                 reset_epoch, tz=timezone.utc
             ).strftime("%Y-%m-%d %H:%M:%S UTC")
             print(
-                f"Core rate limit low (remaining={remaining}). "
+                f"{bucket} rate limit low (remaining={remaining}). "
                 f"Sleeping ~{sleep_for}s until reset ({reset_human}).",
                 file=sys.stderr,
             )
+            ctx.throttle.register_block(sleep_for)
             time.sleep(sleep_for)
 
 
@@ -399,6 +561,13 @@ def _parse_retry_after(text: str) -> int | None:
     return None
 
 
+def _looks_silently_rate_limited(stdout: str) -> bool:
+    """GraphQL returns HTTP 200 with an error body when the primary limit is hit,
+    and 200 or 403 on secondary limits. Exit code 0 is not proof of success."""
+    lowered = stdout.lower()
+    return any(pat in lowered for pat in _SILENT_ERROR_PATTERNS)
+
+
 def gh_call(
     args: list[str],
     ctx: GhContext,
@@ -412,7 +581,7 @@ def gh_call(
         ctx.throttle.acquire(cost)
         success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
 
-        if success:
+        if success and not _looks_silently_rate_limited(stdout):
             return True, stdout, stderr
 
         combined = (stderr + stdout).lower()
@@ -451,7 +620,7 @@ def gh_call(
             with ctx.state.lock:
                 reset_epoch = ctx.state.reset_epoch
             sleep_for = max(reset_epoch - int(time.time()) + 1, 30)
-            print(f"Core rate limit. Pausing all workers {sleep_for}s until reset...", file=sys.stderr)
+            print(f"Primary rate limit. Pausing all workers {sleep_for}s until reset...", file=sys.stderr)
             ctx.throttle.register_block(sleep_for)
             time.sleep(sleep_for)
         else:
@@ -516,12 +685,18 @@ def fetch_veracode_profiles(region: str) -> set[str]:
                     timeout=VERACODE_TIMEOUT,
                 )
                 if response.status_code == 429 or response.status_code >= 500:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        sleep_for = int(retry_after) if retry_after else VERACODE_RETRY_SLEEP * attempt
+                    except ValueError:
+                        sleep_for = VERACODE_RETRY_SLEEP * attempt
                     print(
                         f"  Veracode HTTP {response.status_code} on page {page} "
-                        f"(attempt {attempt}/{VERACODE_MAX_RETRIES}). Retrying...",
+                        f"(attempt {attempt}/{VERACODE_MAX_RETRIES}). "
+                        f"Retrying in {sleep_for}s...",
                         file=sys.stderr,
                     )
-                    time.sleep(VERACODE_RETRY_SLEEP * attempt)
+                    time.sleep(sleep_for)
                     continue
                 break
             except requests.RequestException as exc:
@@ -565,11 +740,18 @@ def fetch_veracode_profiles(region: str) -> set[str]:
         if not apps or (total_pages is not None and page >= total_pages):
             break
 
+    if not profile_names:
+        raise VeracodeError(
+            "Veracode returned 0 application profiles. Refusing to continue: the "
+            "skip check would match nothing and every repo would be triggered."
+        )
+
     print(f"  Loaded {len(profile_names)} unique Veracode profile name(s).")
     return profile_names
 
 
 def build_veracode_profile_name(repo_full_name: str) -> str:
+    """The Workflow App always names profiles '<org>/<repo>'."""
     return repo_full_name.strip().lower()
 
 
@@ -601,20 +783,31 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
         print(f"Error: Failed to fetch repos for org '{org}'.", file=sys.stderr)
         return []
     result = parse_json_safe(stdout, f"fetch_repos org={org}")
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    if len(result) >= limit:
+        print(
+            f"Warning: org '{org}' returned {len(result)} repos, equal to --repo-limit "
+            f"({limit}). The list may be truncated. Raise --repo-limit.",
+            file=sys.stderr,
+        )
+    return result
 
 
 def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
+    """Server-side title search. The old unfiltered --limit 1000 listing pulled up
+    to 10 GraphQL pages per repo just to string-match one title."""
     success, stdout, _ = gh_call(
         [
             "gh", "issue", "list",
             "--repo", repo,
             "--state", "open",
-            "--limit", "1000",
+            "--search", f'"{title}" in:title',
+            "--limit", "20",
             "--json", "number,title",
         ],
         ctx,
-        cost=COST_READ,
+        cost=COST_SEARCH,
     )
     if not success:
         return None
@@ -624,7 +817,25 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
     return [issue["number"] for issue in issues if issue.get("title") == title]
 
 
+def verify_issue_created(repo: str, ctx: GhContext, log: RepoLogger) -> bool | None:
+    """GitHub's issue-creation limit is undisclosed and can silently drop or hide
+    a creation while still returning success. Read it back.
+    True = visible, False = not visible, None = could not verify."""
+    time.sleep(VERIFY_DELAY_SECONDS)
+    nums = find_open_issues(repo, ISSUE_TITLE, ctx)
+    if nums is None:
+        log.warn("Could not verify issue creation (API error).")
+        return None
+    if not nums:
+        log.warn("Create reported success but the issue is not visible. Treating as FAILED.")
+        return False
+    return True
+
+
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
+    """Note: check runs only exist for the head commit of the default branch. A
+    repo committed to since its last scan will report no checks and be treated
+    as stale."""
     if not branch:
         return None
 
@@ -647,9 +858,9 @@ def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime 
     check_runs = parsed.get("check_runs") or []
     completed_times: list[datetime] = []
     for run in check_runs:
-        name = run.get("name") or ""
+        name = (run.get("name") or "").strip().lower()
         completed_at = run.get("completed_at")
-        if not name.startswith("Veracode") or not completed_at:
+        if not name.startswith("veracode") or not completed_at:
             continue
         try:
             completed_times.append(
@@ -730,6 +941,7 @@ def _process_delete_repo(
     repo: dict,
     ctx: GhContext,
     veracode_profiles: set[str] | None,
+    dry_run: bool,
 ) -> RepoResult:
     name = repo["nameWithOwner"]
     issues_enabled = repo["hasIssuesEnabled"]
@@ -758,6 +970,14 @@ def _process_delete_repo(
                 _row_delete(org, repo, 0, "skipped_veracode_profile_exists", vc_exists_str),
                 log.lines, deltas,
             )
+
+    if dry_run and not issues_enabled:
+        log.log("[DRY RUN] Issues disabled. Would enable, close, then re-disable.")
+        return RepoResult(
+            name,
+            _row_delete(org, repo, 0, "dry_run_needs_issues_enabled", vc_exists_str),
+            log.lines, deltas,
+        )
 
     was_disabled = False
     if not issues_enabled:
@@ -796,6 +1016,14 @@ def _process_delete_repo(
             log.lines, deltas,
         )
 
+    if dry_run:
+        log.log(f"[DRY RUN] Would close issue(s): {issue_numbers}")
+        return RepoResult(
+            name,
+            _row_delete(org, repo, len(issue_numbers), "dry_run_would_close", vc_exists_str),
+            log.lines, deltas,
+        )
+
     issues_deleted = issues_failed = 0
     for issue_num in issue_numbers:
         log.log(f"Closing issue #{issue_num}...")
@@ -805,7 +1033,7 @@ def _process_delete_repo(
                 "--comment", "Closed by cleanup script",
             ],
             ctx,
-            cost=COST_CONTENT,
+            cost=COST_CLOSE,
         )
         if success:
             issues_deleted += 1
@@ -834,6 +1062,9 @@ def _process_create_repo(
     ctx: GhContext,
     stale_days: int | None,
     veracode_profiles: set[str] | None,
+    gate: CreateGate,
+    inflight: InflightTracker,
+    dry_run: bool,
 ) -> RepoResult:
     name = repo["nameWithOwner"]
     issues_enabled = repo["hasIssuesEnabled"]
@@ -899,7 +1130,18 @@ def _process_create_repo(
         if last_check:
             log.log(f"Last Veracode check was {days_since} days ago. Proceeding.")
         else:
-            log.log("No Veracode checks found. Proceeding.")
+            log.log("No Veracode checks found on the default branch head. Proceeding.")
+
+    if dry_run and not issues_enabled:
+        log.log("[DRY RUN] Issues disabled. Would enable, create, then re-disable.")
+        return RepoResult(
+            name,
+            _row_create(
+                org, repo, "dry_run_needs_issues_enabled",
+                vc_exists_str, last_check_date, days_since_check,
+            ),
+            log.lines, deltas,
+        )
 
     was_disabled = False
     if not issues_enabled:
@@ -948,23 +1190,36 @@ def _process_create_repo(
             log.lines, deltas,
         )
 
-    log.log("Creating issue...")
-    success, _, _ = gh_call(
-        [
-            "gh", "issue", "create", "--repo", name,
-            "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
-        ],
-        ctx,
-        cost=COST_CONTENT,
-    )
-
-    if success:
+    if dry_run:
+        log.log("[DRY RUN] Would create issue.")
         deltas["created"] = 1
-        action = "created"
+        action = "dry_run_would_create"
     else:
-        log.log("Failed to create issue.")
-        deltas["failed"] = 1
-        action = "failed_create"
+        inflight.wait_for_slot(log)
+        gate.wait(log)
+        log.log("Creating issue...")
+        success, _, _ = gh_call(
+            [
+                "gh", "issue", "create", "--repo", name,
+                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
+            ],
+            ctx,
+            cost=COST_CONTENT,
+        )
+
+        if success:
+            verified = verify_issue_created(name, ctx, log)
+            if verified is False:
+                deltas["failed"] = 1
+                action = "failed_silent_block"
+            else:
+                inflight.add(name)
+                deltas["created"] = 1
+                action = "created" if verified else "created_unverified"
+        else:
+            log.log("Failed to create issue.")
+            deltas["failed"] = 1
+            action = "failed_create"
 
     if was_disabled:
         if not _restore_issues_disabled(name, ctx, log):
@@ -1000,7 +1255,8 @@ def _drive_workers(
     total = len(repos)
     completed = 0
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
         future_to_repo = {executor.submit(worker_fn, repo): repo for repo in repos}
 
         for future in as_completed(future_to_repo):
@@ -1028,6 +1284,12 @@ def _drive_workers(
             with csv_lock:
                 csv_writer.writerow(result.row)
                 csv_file.flush()
+    except KeyboardInterrupt:
+        # Without cancel_futures the pool waits for every queued repo on Ctrl-C.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     return stats
 
@@ -1041,11 +1303,12 @@ def run_delete_mode(
     ctx: GhContext,
     veracode_profiles: set[str] | None,
     workers: int,
+    dry_run: bool,
 ) -> OrgStats:
     check_veracode = veracode_profiles is not None
 
     def worker(repo: dict) -> RepoResult:
-        return _process_delete_repo(org, repo, ctx, veracode_profiles)
+        return _process_delete_repo(org, repo, ctx, veracode_profiles, dry_run)
 
     stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
 
@@ -1074,11 +1337,16 @@ def run_create_mode(
     stale_days: int | None,
     veracode_profiles: set[str] | None,
     workers: int,
+    gate: CreateGate,
+    inflight: InflightTracker,
+    dry_run: bool,
 ) -> OrgStats:
     check_veracode = veracode_profiles is not None
 
     def worker(repo: dict) -> RepoResult:
-        return _process_create_repo(org, repo, ctx, stale_days, veracode_profiles)
+        return _process_create_repo(
+            org, repo, ctx, stale_days, veracode_profiles, gate, inflight, dry_run,
+        )
 
     stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
 
@@ -1192,6 +1460,11 @@ def main() -> None:
 
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would happen. Makes no writes of any kind.",
+    )
+    parser.add_argument(
         "--stale-days",
         type=int,
         metavar="N",
@@ -1224,7 +1497,47 @@ def main() -> None:
         help=(
             f"Parallel worker threads per org (default: {DEFAULT_WORKERS}, "
             f"max: {MAX_WORKERS}). All workers share one rate-limit throttle, "
-            f"so higher values speed up reads without risking secondary limits."
+            f"so higher values speed up reads without risking secondary limits. "
+            f"Issue creation stays serial regardless (see --create-interval)."
+        ),
+    )
+    parser.add_argument(
+        "--create-interval",
+        type=float,
+        default=DEFAULT_CREATE_INTERVAL,
+        metavar="SECONDS",
+        help=(
+            f"Minimum seconds between issue creations, global across all workers "
+            f"and orgs (default: {DEFAULT_CREATE_INTERVAL:.0f}). GitHub's "
+            f"issue-creation limit is undisclosed and fails silently."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Pause after every N issues created (0 = off)",
+    )
+    parser.add_argument(
+        "--batch-pause",
+        type=float,
+        default=DEFAULT_BATCH_PAUSE,
+        metavar="SECONDS",
+        help=(
+            f"Seconds to pause between batches so the Veracode queue drains "
+            f"(default: {DEFAULT_BATCH_PAUSE:.0f})"
+        ),
+    )
+    parser.add_argument(
+        "--max-inflight",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Do not create a new issue while N triggered scans are still queued "
+            "or running (0 = off). Stops Actions jobs aging out past the 6h "
+            "job / GITHUB_TOKEN lifetime."
         ),
     )
     parser.add_argument("--hostname", metavar="HOSTNAME", default=None, help="GitHub hostname for GHES/GHEC")
@@ -1240,6 +1553,20 @@ def main() -> None:
         default=DEFAULT_REPO_LIST_LIMIT,
         help=f"Max repos per org (default: {DEFAULT_REPO_LIST_LIMIT})",
     )
+    parser.add_argument(
+        "--min-remaining",
+        type=int,
+        default=CORE_MIN_REMAINING,
+        metavar="N",
+        help=f"Pause when core or graphql remaining <= N (default: {CORE_MIN_REMAINING})",
+    )
+    parser.add_argument(
+        "--rl-check-every",
+        type=int,
+        default=CORE_CHECK_EVERY,
+        metavar="N",
+        help=f"Query the rate limit every N gh calls (default: {CORE_CHECK_EVERY})",
+    )
 
     args = parser.parse_args()
 
@@ -1249,11 +1576,29 @@ def main() -> None:
         sys.exit("Error: --workers must be >= 1")
     if args.workers > MAX_WORKERS:
         sys.exit(f"Error: --workers must be <= {MAX_WORKERS}")
+    if args.create_interval < 0:
+        sys.exit("Error: --create-interval must be >= 0")
+    if args.batch_size < 0:
+        sys.exit("Error: --batch-size must be >= 0")
+    if args.max_inflight < 0:
+        sys.exit("Error: --max-inflight must be >= 0")
+    if args.min_remaining < 0:
+        sys.exit("Error: --min-remaining must be >= 0")
+    if args.rl_check_every < 1:
+        sys.exit("Error: --rl-check-every must be >= 1")
     if args.delete and args.stale_days is not None:
         print("Warning: --stale-days is ignored in delete mode.", file=sys.stderr)
 
     if shutil.which("gh") is None:
         sys.exit("Error: GitHub CLI (gh) is not installed.")
+
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(
+            "Warning: running inside GitHub Actions. Issues created with GITHUB_TOKEN "
+            "do NOT trigger workflow runs, so no scans will start. Use a PAT or a "
+            "GitHub App token in GH_TOKEN.",
+            file=sys.stderr,
+        )
 
     gh_hostname = args.hostname
     if gh_hostname and "ghe.com" not in gh_hostname and not os.environ.get("GH_ENTERPRISE_TOKEN"):
@@ -1269,13 +1614,23 @@ def main() -> None:
         points_per_min=GH_POINTS_PER_MIN,
         content_per_min=GH_CONTENT_PER_MIN,
         content_per_hour=GH_CONTENT_PER_HOUR,
+        search_per_min=GH_SEARCH_PER_MIN,
     )
 
     ctx = GhContext(
         env=build_gh_env(gh_hostname),
         state=RateLimitState(),
         throttle=throttle,
+        min_remaining=args.min_remaining,
+        check_every=args.rl_check_every,
     )
+
+    gate = CreateGate(
+        interval=args.create_interval,
+        batch_size=args.batch_size,
+        batch_pause=args.batch_pause,
+    )
+    inflight = InflightTracker(cap=args.max_inflight, ctx=ctx)
 
     repo_filter_names: list[str] | None = None
     repo_filter_pattern: str | None = None
@@ -1321,16 +1676,32 @@ def main() -> None:
         )
     print()
 
+    if args.dry_run:
+        print("================================================================")
+        print("DRY RUN: no issues will be created, closed, or enabled")
+        print("================================================================\n")
+
     print(f"Using {args.workers} parallel worker(s) per org.")
     print(
         f"Rate-limit throttle: <= {GH_POINTS_PER_MIN} points/min, "
         f"<= {GH_CONTENT_PER_MIN} content writes/min, "
-        f"<= {GH_CONTENT_PER_HOUR} content writes/hour (shared across all workers)."
+        f"<= {GH_CONTENT_PER_HOUR} content writes/hour, "
+        f"<= {GH_SEARCH_PER_MIN} searches/min (shared across all workers)."
     )
+    if not args.delete:
+        print(
+            f"Creation pacing: 1 issue every {args.create_interval:.0f}s"
+            + (
+                f", pause {args.batch_pause:.0f}s every {args.batch_size}"
+                if args.batch_size else ""
+            )
+            + (f", max {args.max_inflight} scans in flight" if args.max_inflight else "")
+            + "."
+        )
 
     if args.delete:
         print("================================================================")
-        print(f"DELETE MODE: Removing issues with title '{ISSUE_TITLE}'")
+        print(f"DELETE MODE: Closing issues with title '{ISSUE_TITLE}'")
         print("================================================================\n")
         fieldnames = DELETE_FIELDNAMES
         if use_veracode:
@@ -1386,12 +1757,13 @@ def main() -> None:
                 if args.delete:
                     stats = run_delete_mode(
                         org, repos, csv_writer, csv_file, csv_lock, ctx,
-                        veracode_profiles, args.workers,
+                        veracode_profiles, args.workers, args.dry_run,
                     )
                 else:
                     stats = run_create_mode(
                         org, repos, csv_writer, csv_file, csv_lock, ctx,
                         args.stale_days, veracode_profiles, args.workers,
+                        gate, inflight, args.dry_run,
                     )
 
                 all_stats.append(stats)

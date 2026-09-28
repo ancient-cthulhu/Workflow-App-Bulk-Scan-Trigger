@@ -121,12 +121,22 @@ The API account needs read access to the Applications API (Security Lead, Review
 
 ### Required Permissions
 
-| Operation | Required |
-|-----------|----------|
-| Create / close issues | Read access + permission to create issues |
-| Enable Issues on repos where disabled | Admin permission on those repos |
-| Read workflow run status (`--max-inflight`) | Actions read access |
-| Query Veracode profiles | Veracode API account with read access to Applications |
+Use a classic personal access token with these scopes:
+
+| Scope | Why |
+|-------|-----|
+| `repo` | List repos, create and close issues, enable Issues, read check runs (`--stale-days`) and Actions runs (`--max-inflight`) |
+| `read:org` | Required by the `gh` CLI |
+
+The token owner also needs these repository roles:
+
+| Operation | Minimum role |
+|-----------|--------------|
+| Create issues | Read |
+| Close issues opened by another account (`--delete`) | Triage |
+| Enable Issues on repos where disabled | Admin |
+
+If the org uses SAML SSO, authorize the token for it: **Settings > Developer settings > Personal access tokens (classic) > Configure SSO**.
 
 ---
 

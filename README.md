@@ -13,11 +13,12 @@ For each repository in the target organization, the script:
 3. Optionally skips repos that already have a Veracode application profile on the platform (`--veracode-skip-existing`)
 4. Optionally checks for recent Veracode scans and skips repos scanned within N days (`--stale-days`)
 5. Temporarily enables Issues if disabled (restores original state after)
-6. Checks for an existing open trigger issue to avoid duplicates
+6. Checks for an existing open trigger issue (direct read of the repo's open issues, not search). If one is open, the repo is skipped, unless `--rescan-existing` is set
 7. Waits for a creation slot (`--create-interval`, `--batch-size`, `--max-inflight`)
-8. Creates the trigger issue, then reads it back to confirm it actually exists
-9. Writes a per-repo result row to the CSV audit trail
-10. Proactively checks GitHub Core **and GraphQL** rate limits and sleeps until reset if either is low
+8. Re-checks for an open trigger issue right before writing (the slot wait can be long)
+9. If none exists, creates the trigger issue, then reads it back to confirm it exists. If one exists, skips the repo, or with `--rescan-existing` comments `Veracode All Scans` on it to re-trigger the scan
+10. Writes a per-repo result row to the CSV audit trail
+11. Proactively checks GitHub Core **and GraphQL** rate limits and sleeps until reset if either is low
 
 Repos within an org are processed in parallel by a configurable thread pool (`--workers`). Each repo is one atomic work unit so the enable-issues / create-issue / restore-issues sequence stays consistent per repo while different repos run concurrently. Issue creation itself is serialized globally regardless of worker count.
 
@@ -58,6 +59,9 @@ python script.py --repo-file repos.txt my-github-org
 
 # Wildcard
 python script.py --repo-wildcard "*-service" my-github-org
+
+# Rescan: comment on existing open trigger issues instead of skipping them
+python script.py --rescan-existing --stale-days 30 my-github-org
 
 # Clean up
 python script.py --delete --org-file orgs.txt
@@ -161,11 +165,12 @@ The command value must exactly match the Workflow App command name. This mismatc
 | Flag | Description |
 |------|-------------|
 | `org` | Single org name (positional argument) |
-| `--org-file FILE` | Text file with one org per line. `#` and blank lines ignored. Mutually exclusive with the positional org and `--org-repo-file`. |
+| `--org-file FILE` | Text file with one org per line. `#` and blank lines ignored. Duplicate orgs (case-insensitive) are processed once. Mutually exclusive with the positional org and `--org-repo-file`. |
 | `--org-repo-file FILE` | CSV file with 2 columns: `org` and `repo`. Supports quoted values. Targets only the listed org/repo combinations. `#` and blank lines ignored. Mutually exclusive with the positional org, `--org-file`, `--repo-file` and `--repo-wildcard`. See [Org-Repo Filtering](#org-repo-filtering). |
 | `--repo-file FILE` | Text file with one repo name per line (no org prefix). Mutually exclusive with `--repo-wildcard` and `--org-repo-file`. |
 | `--repo-wildcard PATTERN` | Wildcard filter, case-insensitive. Mutually exclusive with `--repo-file` and `--org-repo-file`. |
 | `--delete` | Close previously created trigger issues instead of creating new ones |
+| `--rescan-existing` | If an open trigger issue already exists, comment `Veracode All Scans` on it to re-trigger the scan instead of skipping the repo. A new issue is only created when none is open. Off by default. See [Duplicate Protection and Rescans](#duplicate-protection-and-rescans). |
 | `--dry-run` | Report what would happen. Makes no writes of any kind. Works in create and delete mode. |
 | `--stale-days N` | Only create issues for repos not scanned in the last N days. Disabled by default. `0` disables. Ignored in delete mode. |
 | `--veracode-skip-existing` | Query the Veracode platform once at startup and skip repos that already have a profile named `<org>/<repo>` (case-insensitive). |
@@ -191,7 +196,7 @@ The command value must exactly match the Workflow App command name. This mismatc
 | `GH_POINTS_PER_MIN` | `700` | Secondary-limit point budget (GitHub allows 900 REST / 2000 GraphQL) |
 | `GH_CONTENT_PER_MIN` | `20` | Content writes per minute (GitHub allows 80) |
 | `GH_CONTENT_PER_HOUR` | `140` | Content writes per hour (GitHub allows 500) |
-| `GH_SEARCH_PER_MIN` | `25` | Issue-title searches per minute (GitHub allows 30) |
+| `GH_SEARCH_PER_MIN` | `25` | Search API calls per minute (GitHub allows 30). The existing-issue check no longer uses search, so this rarely applies. |
 
 Flags take precedence over the env vars they share a default with.
 
@@ -221,9 +226,10 @@ GitHub's published limits: 900 points/min for REST, 2,000 points/min for GraphQL
 
 The script handles these automatically:
 
-- **Primary limits**: checks Core **and** GraphQL buckets (`gh repo list`, `gh issue list` and `gh repo edit` are GraphQL, so Core alone never fires) and sleeps until whichever is closer to empty resets. State is shared across all worker threads.
+- **Primary limits**: checks Core **and** GraphQL buckets (`gh repo list`, `gh issue create` and `gh repo edit` are GraphQL, so Core alone never fires) and sleeps until whichever is closer to empty resets. State is shared across all worker threads.
 - **Secondary limits**: a shared throttle enforces the point, content/min, content/hour and search/min budgets, plus a 1 second minimum gap between mutations, across every worker. A secondary-limit hit pauses **all** workers, not just the one that hit it, with exponential backoff, retried up to 3 times, honouring `Retry-After` where present.
-- **Silent failures**: GitHub returns HTTP 200 with an error body when the GraphQL primary limit is hit, and 200 or 403 on secondary limits, so exit code alone is not proof. The script inspects response bodies and, after every issue creation, reads the issue back to confirm it exists. A create that reports success but produces no visible issue is recorded as `failed_silent_block`.
+- **Silent failures**: GitHub returns HTTP 200 with an error body when the GraphQL primary limit is hit, and 200 or 403 on secondary limits, so exit code alone is not proof. The script inspects response bodies and, after every issue creation, reads the issue back (up to 3 times) to confirm it exists. A create that reports success but produces no visible issue is recorded as `failed_silent_block`.
+- **Non-idempotent writes are never blindly retried**: if an issue create or comment fails with a rate limit or timeout, the script backs off, then checks whether the write landed anyway. It only retries if it did not, so one repo cannot end up with several issues or several trigger comments.
 - **Auth failures** (bad credentials, 404, insufficient permissions): not retried, reported immediately, recorded in the CSV.
 - **Veracode 429 / 5xx**: retried with backoff at startup, honouring `Retry-After`. Aborts the run after retries are exhausted, and also aborts if the platform returns zero profiles.
 
@@ -379,7 +385,7 @@ Run under `tmux` or `nohup`. Bulk runs are long by design.
 The CSV is overwritten on each run. To retry only what did not get an issue:
 
 ```bash
-awk -F, 'NR>1 && $9 !~ /^created/ {split($2,a,"/"); print a[2]}' vcbaseline.csv > retry.txt
+awk -F, 'NR>1 && $9 !~ /^(created|commented)/ {split($2,a,"/"); print a[2]}' vcbaseline.csv > retry.txt
 python script.py my-github-org --repo-file retry.txt --output vcbaseline-retry.csv
 ```
 
@@ -407,16 +413,21 @@ python script.py my-github-org --repo-file retry.txt --output vcbaseline-retry.c
 |----------------|---------|
 | `created` | Issue created and verified present |
 | `created_unverified` | Issue created but the read-back check itself errored. Verify manually. |
-| `failed_silent_block` | Create returned success but no issue is visible. GitHub silently dropped it. Increase `--create-interval` and retry. |
+| `failed_silent_block` | Create returned success but no issue is visible after 3 read-backs. GitHub silently dropped it. Increase `--create-interval` and retry. A retry run re-checks first, so it will not duplicate an issue that did land. |
 | `created_restore_failed` | Created, but the repo's original issues-disabled state could not be restored. Manual cleanup may be required. |
+| `commented_existing` | `--rescan-existing` only. Commented on the existing trigger issue to re-trigger the scan. |
+| `failed_comment` | `--rescan-existing` only. Comment on the existing trigger issue failed |
+| `failed_comment_unknown` | `--rescan-existing` only. Comment errored and the follow-up check also failed. Not retried, to avoid a duplicate scan. Check the issue manually. |
 | `dry_run_would_create` | `--dry-run` only. Would have created an issue. |
+| `dry_run_would_comment` | `--dry-run --rescan-existing` only. Would have commented on the existing issue. |
 | `dry_run_needs_issues_enabled` | `--dry-run` only. Would have enabled Issues first. |
 | `skipped_veracode_profile_exists` | Profile already exists on the Veracode platform |
 | `skipped_recent_check` | Veracode check found within `--stale-days` |
-| `skipped_existing_issue` | Open trigger issue already exists |
+| `skipped_existing_issue` | Open trigger issue already exists (default, without `--rescan-existing`) |
 | `skipped_archived` | Repository is archived |
 | `skipped_cant_enable_issues` | Issues could not be enabled (insufficient permissions) |
 | `failed_create` | Issue creation API call failed |
+| `failed_create_unknown` | Create errored and the follow-up check also failed. Not retried, to avoid a duplicate. Check the repo manually. |
 | `failed_create_restore_failed` | Creation failed AND the issues-disabled state could not be restored |
 | `failed_query_issues` | Could not check for existing issues; creation skipped to prevent duplicates |
 
@@ -445,15 +456,37 @@ python script.py my-github-org --repo-file retry.txt --output vcbaseline-retry.c
 
 ---
 
-## Duplicate Protection
+## Duplicate Protection and Rescans
 
-Before creating an issue, the script searches for an open issue with the same title using a server-side title search (`in:title`). If the check fails, creation is skipped and recorded as `failed_query_issues`. This prevents duplicates when the existing-issue check cannot be completed.
+The script looks for an open issue titled `Veracode Baseline Scans` by reading the repo's open issues directly through the REST API (`GET /repos/{owner}/{repo}/issues?state=open`, paginated) and matching the title exactly. Pull requests returned by that endpoint are ignored.
 
-To re-trigger scans:
+Earlier versions used `gh issue list --search`, which goes through GitHub's search index. The index lags behind writes, so a just-created issue could be invisible to the check and to the read-back. That caused duplicates on re-runs and false `failed_silent_block` results that were then retried. The direct read does not depend on the index.
+
+Other safeguards:
+
+- **Re-check before writing.** Repos can wait a long time for a slot (`--batch-pause`, `--max-inflight`). The script checks again right before creating, so an issue opened meanwhile is not duplicated.
+- **No blind retries.** A create or comment that fails with a rate limit or timeout is only retried after confirming it did not land.
+- **Lookup failures skip the repo.** If the check fails, nothing is written and the row is `failed_query_issues`.
+- **Orgs are de-duplicated.** The same org listed twice in `--org-file` or `--org-repo-file` (any case) is processed once.
+- **Existing duplicates are flagged.** If a repo already has more than one open trigger issue, a `[WARN]` line lists them. Clean them up with `--delete`.
+
+### What happens when a trigger issue is already open
+
+| Mode | Behaviour |
+|------|-----------|
+| Default | Skip the repo (`skipped_existing_issue`). Nothing is written. |
+| `--rescan-existing` | Comment `Veracode All Scans` on the oldest open trigger issue (`commented_existing`). No new issue. |
+
+Repos with no open trigger issue get a new issue in both modes.
+
+The Workflow App starts a scan when a comment containing the `issues.commands` value is added to an issue, the same as on issue creation. Comments use the same `--create-interval`, `--batch-size` and `--max-inflight` pacing as creations.
+
+With `--rescan-existing`, also pass `--stale-days` so repos with a scan running or recently completed are not commented on again.
+
+Other ways to re-trigger:
 
 - Use `--delete` to close existing issues, then run again in create mode
 - Close the existing issue manually
-- Update `ISSUE_TITLE` in the script
 
 ---
 

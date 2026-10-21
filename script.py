@@ -45,6 +45,8 @@ DEFAULT_CREATE_INTERVAL = 25.0
 DEFAULT_BATCH_PAUSE = 900.0
 INFLIGHT_POLL_SECONDS = 60
 VERIFY_DELAY_SECONDS = 3
+VERIFY_ATTEMPTS = 3
+COMMENT_SINCE_MARGIN_SECONDS = 120
 
 VERACODE_REGIONS = {
     "commercial": "https://api.veracode.com/appsec/v1",
@@ -376,6 +378,7 @@ class OrgStats:
     skipped_recent: int = 0
     skipped_veracode_profile: int = 0
     created: int = 0
+    commented: int = 0
     skipped_no_issues: int = 0
     deleted: int = 0
     failed: int = 0
@@ -435,12 +438,27 @@ def _load_lines(file_path: str, exc_cls: type[Exception], kind: str) -> list[str
     return items
 
 
+def dedupe_orgs(orgs: list[str]) -> list[str]:
+    """GitHub org names are case-insensitive. Processing the same org twice
+    in one run could create duplicate issues, so keep the first spelling."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for org in orgs:
+        key = org.lower()
+        if key in seen:
+            print(f"Warning: org '{org}' listed more than once. Processing it once.", file=sys.stderr)
+            continue
+        seen.add(key)
+        unique.append(org)
+    return unique
+
+
 def load_orgs_from_file(file_path: str) -> list[str]:
     orgs = _load_lines(file_path, OrgFileError, "org")
     invalid = [o for o in orgs if not validate_org_name(o)]
     if invalid:
         raise OrgFileError(f"Invalid org name(s) in '{file_path}': {', '.join(invalid)}")
-    return orgs
+    return dedupe_orgs(orgs)
 
 
 def load_repos_from_file(file_path: str) -> list[str]:
@@ -604,15 +622,28 @@ def _looks_silently_rate_limited(stdout: str) -> bool:
     return any(pat in lowered for pat in _SILENT_ERROR_PATTERNS)
 
 
+def _is_rate_limited(text: str) -> bool:
+    lowered = text.lower()
+    return any(pat in lowered for pat in _RATE_LIMIT_PATTERNS)
+
+
+def _is_auth_failure(text: str) -> bool:
+    lowered = text.lower()
+    return any(pat in lowered for pat in _AUTH_FAILURE_PATTERNS)
+
+
 def gh_call(
     args: list[str],
     ctx: GhContext,
     cost: CallCost = COST_READ,
     timeout: int = SUBPROCESS_TIMEOUT,
+    max_retries: int = MAX_RATE_LIMIT_RETRIES,
 ) -> tuple[bool, str, str]:
+    """max_retries=0 makes a single attempt. Use it for non-idempotent writes
+    (issue create, comment) whose callers re-check before retrying."""
     delay = SECONDARY_RATE_LIMIT_SLEEP
 
-    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+    for attempt in range(max_retries + 1):
         maybe_pause_for_rate_limit(ctx)
         ctx.throttle.acquire(cost)
         success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
@@ -631,11 +662,12 @@ def gh_call(
             print(stderr, file=sys.stderr)
             return False, stdout, stderr
 
-        if attempt == MAX_RATE_LIMIT_RETRIES:
-            print(
-                f"Rate limit retries exhausted ({MAX_RATE_LIMIT_RETRIES}). Giving up.",
-                file=sys.stderr,
-            )
+        if attempt == max_retries:
+            if max_retries > 0:
+                print(
+                    f"Rate limit retries exhausted ({max_retries}). Giving up.",
+                    file=sys.stderr,
+                )
             print(stderr, file=sys.stderr)
             return False, stdout, stderr
 
@@ -645,7 +677,7 @@ def gh_call(
         if is_secondary or retry_after is not None:
             block_for = retry_after if retry_after is not None else delay
             print(
-                f"Secondary rate limit (attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES}). "
+                f"Secondary rate limit (attempt {attempt + 1}/{max_retries}). "
                 f"Pausing all workers {block_for}s...",
                 file=sys.stderr,
             )
@@ -831,41 +863,206 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
 
 
 def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
-    """Server-side title search. The old unfiltered --limit 1000 listing pulled up
-    to 10 GraphQL pages per repo just to string-match one title."""
+    """Lists open issues directly (REST, paginated) and matches the title exactly.
+
+    Deliberately NOT `gh issue list --search`: search is index-backed and lags,
+    so a just-created issue can be invisible for seconds or longer. That lag
+    let re-runs and the read-back check miss existing issues and create
+    duplicates. The REST issues list also returns pull requests (items with a
+    `pull_request` key), which are filtered out.
+
+    Returns issue numbers sorted oldest first, [] if none, None on API error."""
+    jq = (
+        f".[] | select(.pull_request == null and .title == {json.dumps(title)}) "
+        "| .number"
+    )
     success, stdout, _ = gh_call(
         [
-            "gh", "issue", "list",
-            "--repo", repo,
-            "--state", "open",
-            "--search", f'"{title}" in:title',
-            "--limit", "20",
-            "--json", "number,title",
+            "gh", "api", f"repos/{repo}/issues",
+            "-X", "GET",
+            "-f", "state=open",
+            "-f", "per_page=100",
+            "--paginate",
+            "--jq", jq,
         ],
         ctx,
-        cost=COST_SEARCH,
+        cost=COST_READ,
     )
     if not success:
         return None
-    issues = parse_json_safe(stdout, f"find_open_issues repo={repo}")
-    if not isinstance(issues, list):
-        return None
-    return [issue["number"] for issue in issues if issue.get("title") == title]
+    numbers: list[int] = []
+    for line in stdout.split():
+        try:
+            numbers.append(int(line))
+        except ValueError:
+            print(
+                f"Error: unexpected output from issue lookup (repo={repo}): {line[:100]!r}",
+                file=sys.stderr,
+            )
+            return None
+    return sorted(set(numbers))
 
 
 def verify_issue_created(repo: str, ctx: GhContext, log: RepoLogger) -> bool | None:
     """GitHub's issue-creation limit is undisclosed and can silently drop or hide
-    a creation while still returning success. Read it back.
+    a creation while still returning success. Read it back, a few times.
     True = visible, False = not visible, None = could not verify."""
-    time.sleep(VERIFY_DELAY_SECONDS)
-    nums = find_open_issues(repo, ISSUE_TITLE, ctx)
-    if nums is None:
-        log.warn("Could not verify issue creation (API error).")
-        return None
-    if not nums:
-        log.warn("Create reported success but the issue is not visible. Treating as FAILED.")
+    for attempt in range(1, VERIFY_ATTEMPTS + 1):
+        time.sleep(VERIFY_DELAY_SECONDS * attempt)
+        nums = find_open_issues(repo, ISSUE_TITLE, ctx)
+        if nums is None:
+            log.warn("Could not verify issue creation (API error).")
+            return None
+        if nums:
+            return True
+    log.warn(
+        f"Create reported success but the issue is not visible after "
+        f"{VERIFY_ATTEMPTS} checks. Treating as FAILED."
+    )
+    return False
+
+
+def _write_backoff(attempt: int, stdout: str, stderr: str) -> int:
+    """Back-off before retrying a non-idempotent write."""
+    retry_after = _parse_retry_after((stderr + stdout).lower())
+    if retry_after is not None:
+        return retry_after
+    return min(SECONDARY_RATE_LIMIT_SLEEP * (2 ** attempt), SECONDARY_BACKOFF_CAP)
+
+
+def _retryable_write_failure(stdout: str, stderr: str) -> bool:
+    """Rate limits and timeouts may or may not have landed; worth a re-check and
+    retry. Anything else (auth, validation, 404) will not succeed on retry."""
+    combined = stderr + stdout
+    if _is_auth_failure(combined):
         return False
-    return True
+    return stderr == "timeout" or _is_rate_limited(combined)
+
+
+def create_trigger_issue(name: str, ctx: GhContext, log: RepoLogger) -> str:
+    """Creates the trigger issue without ever blindly resending the create.
+
+    A create can fail on our side (rate-limit response, timeout) after GitHub
+    already stored the issue. Retrying straight away was a source of
+    duplicates, so before every retry the repo is re-checked and the retry is
+    skipped if the issue is already there.
+
+    Returns the CSV action string."""
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        success, stdout, stderr = gh_call(
+            [
+                "gh", "issue", "create", "--repo", name,
+                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
+            ],
+            ctx,
+            cost=COST_CONTENT,
+            max_retries=0,
+        )
+
+        if success:
+            verified = verify_issue_created(name, ctx, log)
+            if verified is False:
+                return "failed_silent_block"
+            return "created" if verified else "created_unverified"
+
+        if not _retryable_write_failure(stdout, stderr):
+            log.log("Failed to create issue.")
+            return "failed_create"
+
+        block_for = _write_backoff(attempt, stdout, stderr)
+        log.warn(
+            f"Create hit a rate limit or timeout (attempt {attempt + 1}). "
+            f"Waiting {block_for}s, then checking whether it landed anyway."
+        )
+        ctx.throttle.register_block(block_for)
+        time.sleep(block_for)
+
+        existing = find_open_issues(name, ISSUE_TITLE, ctx)
+        if existing is None:
+            log.log("Could not re-check for the issue (API error). Not retrying, to avoid a duplicate.")
+            return "failed_create_unknown"
+        if existing:
+            log.log(f"Issue #{existing[0]} exists despite the error. Not creating another.")
+            return "created"
+
+    log.log("Failed to create issue after retries.")
+    return "failed_create"
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def find_trigger_comments_since(
+    repo: str, issue: int, since_ts: float, ctx: GhContext,
+) -> list[int] | None:
+    """IDs of comments on `issue` whose body is exactly ISSUE_BODY, updated after
+    since_ts. None on API error."""
+    jq = f".[] | select(.body == {json.dumps(ISSUE_BODY)}) | .id"
+    success, stdout, _ = gh_call(
+        [
+            "gh", "api", f"repos/{repo}/issues/{issue}/comments",
+            "-X", "GET",
+            "-f", f"since={_utc_iso(since_ts)}",
+            "-f", "per_page=100",
+            "--paginate",
+            "--jq", jq,
+        ],
+        ctx,
+        cost=COST_READ,
+    )
+    if not success:
+        return None
+    try:
+        return [int(x) for x in stdout.split()]
+    except ValueError:
+        return None
+
+
+def comment_trigger_issue(name: str, issue: int, ctx: GhContext, log: RepoLogger) -> str:
+    """Comments ISSUE_BODY on an existing trigger issue to re-trigger the scan.
+    Same no-blind-retry rule as create_trigger_issue: a duplicate comment would
+    start a duplicate scan. Returns the CSV action string."""
+    # Margin covers clock skew between this machine and GitHub. A matching
+    # comment from anyone else in that window has already triggered a scan,
+    # so treating it as done is correct.
+    since_ts = time.time() - COMMENT_SINCE_MARGIN_SECONDS
+
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        success, stdout, stderr = gh_call(
+            [
+                "gh", "issue", "comment", str(issue), "--repo", name,
+                "--body", ISSUE_BODY,
+            ],
+            ctx,
+            cost=COST_CONTENT,
+            max_retries=0,
+        )
+        if success:
+            return "commented_existing"
+
+        if not _retryable_write_failure(stdout, stderr):
+            log.log(f"Failed to comment on issue #{issue}.")
+            return "failed_comment"
+
+        block_for = _write_backoff(attempt, stdout, stderr)
+        log.warn(
+            f"Comment hit a rate limit or timeout (attempt {attempt + 1}). "
+            f"Waiting {block_for}s, then checking whether it landed anyway."
+        )
+        ctx.throttle.register_block(block_for)
+        time.sleep(block_for)
+
+        landed = find_trigger_comments_since(name, issue, since_ts, ctx)
+        if landed is None:
+            log.log("Could not re-check comments (API error). Not retrying, to avoid a duplicate scan.")
+            return "failed_comment_unknown"
+        if landed:
+            log.log("Comment exists despite the error. Not posting another.")
+            return "commented_existing"
+
+    log.log(f"Failed to comment on issue #{issue} after retries.")
+    return "failed_comment"
 
 
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
@@ -1101,6 +1298,7 @@ def _process_create_repo(
     gate: CreateGate,
     inflight: InflightTracker,
     dry_run: bool,
+    rescan_existing: bool = False,
 ) -> RepoResult:
     name = repo["nameWithOwner"]
     issues_enabled = repo["hasIssuesEnabled"]
@@ -1212,8 +1410,14 @@ def _process_create_repo(
             log.lines, deltas,
         )
 
-    if existing_issues:
-        log.log("Open issue with same title already exists. Skipping.")
+    if len(existing_issues) > 1:
+        log.warn(
+            f"{len(existing_issues)} open '{ISSUE_TITLE}' issues already exist "
+            f"(#{', #'.join(map(str, existing_issues))}). Duplicates from an earlier run."
+        )
+
+    if existing_issues and not rescan_existing:
+        log.log(f"Open trigger issue #{existing_issues[0]} already exists. Skipping.")
         deltas["skipped_existing"] = 1
         if was_disabled:
             _restore_issues_disabled(name, ctx, log)
@@ -1227,35 +1431,65 @@ def _process_create_repo(
         )
 
     if dry_run:
-        log.log("[DRY RUN] Would create issue.")
-        deltas["created"] = 1
-        action = "dry_run_would_create"
+        if existing_issues:
+            log.log(f"[DRY RUN] Would comment on existing issue #{existing_issues[0]} to rescan.")
+            deltas["commented"] = 1
+            action = "dry_run_would_comment"
+        else:
+            log.log("[DRY RUN] Would create issue.")
+            deltas["created"] = 1
+            action = "dry_run_would_create"
     else:
         inflight.wait_for_slot(log)
         gate.wait(log)
-        log.log("Creating issue...")
-        success, _, _ = gh_call(
-            [
-                "gh", "issue", "create", "--repo", name,
-                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
-            ],
-            ctx,
-            cost=COST_CONTENT,
-        )
 
-        if success:
-            verified = verify_issue_created(name, ctx, log)
-            if verified is False:
-                deltas["failed"] = 1
-                action = "failed_silent_block"
+        if not existing_issues:
+            # The slot wait can be long (batch pause, in-flight cap). Re-check
+            # right before writing so an issue opened meanwhile (another run,
+            # a person) is not duplicated.
+            recheck = find_open_issues(name, ISSUE_TITLE, ctx)
+            if recheck is None:
+                log.log("Could not re-check existing issues (API error). Skipping to avoid duplicates.")
+                recheck_action = "failed_query_issues"
+            elif recheck and not rescan_existing:
+                log.log(f"Trigger issue #{recheck[0]} appeared while waiting. Skipping.")
+                recheck_action = "skipped_existing_issue"
             else:
-                inflight.add(name)
-                deltas["created"] = 1
-                action = "created" if verified else "created_unverified"
+                recheck_action = None
+                existing_issues = recheck
+
+            if recheck_action is not None:
+                if recheck_action == "failed_query_issues":
+                    deltas["failed"] = 1
+                else:
+                    deltas["skipped_existing"] = 1
+                if was_disabled:
+                    _restore_issues_disabled(name, ctx, log)
+                return RepoResult(
+                    name,
+                    _row_create(
+                        org, repo, recheck_action,
+                        vc_exists_str, last_check_date, days_since_check,
+                    ),
+                    log.lines, deltas,
+                )
+
+        if existing_issues:
+            target = existing_issues[0]
+            log.log(f"Commenting on existing issue #{target} to rescan...")
+            action = comment_trigger_issue(name, target, ctx, log)
         else:
-            log.log("Failed to create issue.")
+            log.log("Creating issue...")
+            action = create_trigger_issue(name, ctx, log)
+
+        if action in ("created", "created_unverified"):
+            inflight.add(name)
+            deltas["created"] = 1
+        elif action == "commented_existing":
+            inflight.add(name)
+            deltas["commented"] = 1
+        else:
             deltas["failed"] = 1
-            action = "failed_create"
 
     if was_disabled:
         if not _restore_issues_disabled(name, ctx, log):
@@ -1376,12 +1610,14 @@ def run_create_mode(
     gate: CreateGate,
     inflight: InflightTracker,
     dry_run: bool,
+    rescan_existing: bool = False,
 ) -> OrgStats:
     check_veracode = veracode_profiles is not None
 
     def worker(repo: dict) -> RepoResult:
         return _process_create_repo(
             org, repo, ctx, stale_days, veracode_profiles, gate, inflight, dry_run,
+            rescan_existing,
         )
 
     stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
@@ -1399,7 +1635,8 @@ def run_create_mode(
     if stale_days:
         print(f"Skipped Recent Checks:    {stats.skipped_recent} (scanned within {stale_days} days)")
     print(f"Created Issues:           {stats.created}")
-    print(f"Failed Creates:           {stats.failed}")
+    print(f"Commented Existing:       {stats.commented}")
+    print(f"Failed Creates/Comments:  {stats.failed}")
     print("----------------------------------------------------------------")
 
     return stats
@@ -1439,6 +1676,7 @@ def print_multi_org_summary(
             ("Org", "<30", lambda s: s.org),
             ("Repos", ">6", lambda s: s.total_repos),
             ("Created", ">8", lambda s: s.created),
+            ("Comment", ">8", lambda s: s.commented),
             ("Failed", ">8", lambda s: s.failed),
             ("Archived", ">9", lambda s: s.archived),
             ("Skipped", ">8", lambda s: s.skipped_existing),
@@ -1500,6 +1738,16 @@ def main() -> None:
     )
 
     parser.add_argument("--delete", action="store_true", help="Close previously created trigger issues")
+    parser.add_argument(
+        "--rescan-existing",
+        action="store_true",
+        help=(
+            "If an open trigger issue already exists, comment on it to "
+            "re-trigger the scan instead of skipping the repo. A new issue is "
+            "only created when none is open. Default: skip repos that already "
+            "have an open trigger issue."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1698,7 +1946,12 @@ def main() -> None:
         except OrgRepoFileError as exc:
             sys.exit(f"Error: {exc}")
         print(f"Loaded {len(org_repo_pairs)} org-repo pair(s) from '{args.org_repo_file}'.")
-        orgs = list(dict.fromkeys(org for org, _ in org_repo_pairs))
+        orgs = []
+        seen_orgs: set[str] = set()
+        for org, _ in org_repo_pairs:
+            if org.lower() not in seen_orgs:
+                seen_orgs.add(org.lower())
+                orgs.append(org)
         print(f"Targeting {len(orgs)} org(s) from '{args.org_repo_file}'.")
     elif args.org_file:
         try:
@@ -1764,6 +2017,10 @@ def main() -> None:
             print("================================================================\n")
     else:
         fieldnames = CREATE_FIELDNAMES
+        if args.rescan_existing:
+            print("================================================================")
+            print(f"RESCAN MODE: Commenting on existing open '{ISSUE_TITLE}' issues")
+            print("================================================================\n")
         if args.stale_days:
             print("================================================================")
             print(f"STALE CHECK MODE: Creating issues for repos not scanned in {args.stale_days} days")
@@ -1797,7 +2054,7 @@ def main() -> None:
 
                 original_count = len(repos)
                 if org_repo_pairs:
-                    target_repos = [repo for o, repo in org_repo_pairs if o == org]
+                    target_repos = [repo for o, repo in org_repo_pairs if o.lower() == org.lower()]
                     repos = filter_repos_by_names(repos, target_repos)
                     print(f"Filtered to {len(repos)}/{original_count} repos from --org-repo-file for '{org}'")
                 elif repo_filter_names:
@@ -1821,7 +2078,7 @@ def main() -> None:
                     stats = run_create_mode(
                         org, repos, csv_writer, csv_file, csv_lock, ctx,
                         args.stale_days, veracode_profiles, args.workers,
-                        gate, inflight, args.dry_run,
+                        gate, inflight, args.dry_run, args.rescan_existing,
                     )
 
                 all_stats.append(stats)

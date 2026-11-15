@@ -1,0 +1,2 @@
+# No third-party packages: standard library only.
+# Requires Python 3.9+ and the GitHub CLI (gh), authenticated.

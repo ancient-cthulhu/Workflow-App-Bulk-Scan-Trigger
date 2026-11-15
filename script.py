@@ -18,8 +18,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -28,7 +30,8 @@ ISSUE_BODY = "Veracode All Scans"
 IAC_LANGUAGES = frozenset({"HCL", "Bicep"})
 SUBPROCESS_TIMEOUT = 60
 REPO_LIST_TIMEOUT = 300
-DEFAULT_OUTPUT_FILE = "vcbaseline.csv"
+# --paginate walks every page in one gh process; 60s is too short on busy repos.
+PAGINATE_TIMEOUT = 180
 DEFAULT_STALE_DAYS = 30
 SECONDARY_RATE_LIMIT_SLEEP = 60
 SECONDARY_BACKOFF_CAP = 600
@@ -43,7 +46,17 @@ MUTATION_MIN_GAP = 1.0
 # undisclosed and fails silently, so this is deliberately conservative.
 DEFAULT_CREATE_INTERVAL = 25.0
 DEFAULT_BATCH_PAUSE = 900.0
+# Delete mode: issue closes per minute, global. Closing (PATCH state) is not
+# content creation, so it is only bound by this and MUTATION_MIN_GAP.
+DEFAULT_CLOSE_PER_MINUTE = 40
+CLOSE_ATTEMPTS = 2
 INFLIGHT_POLL_SECONDS = 60
+# --max-inflight: how long Actions-API errors may last before a repo gives up
+# waiting, how long a full queue may block one repo, and how long a reserved
+# slot is counted before its run must be visible in the central repo.
+INFLIGHT_ERROR_TIMEOUT = 1800
+INFLIGHT_MAX_WAIT = 7 * 3600
+INFLIGHT_GRACE_SECONDS = 300
 VERIFY_DELAY_SECONDS = 3
 VERIFY_ATTEMPTS = 3
 COMMENT_SINCE_MARGIN_SECONDS = 120
@@ -57,6 +70,28 @@ VERACODE_PAGE_SIZE = 500
 VERACODE_TIMEOUT = 60
 VERACODE_MAX_RETRIES = 3
 VERACODE_RETRY_SLEEP = 5
+# 7th character of the 8-character API key id prefix (e.g. "vera01ei-...").
+# Ids without a prefix are commercial.
+_VERACODE_KEY_REGION = {"g": "commercial", "e": "eu", "f": "federal"}
+_VERACODE_KEY_PREFIX_RE = re.compile(r"^vera[a-z0-9]{4}-", re.IGNORECASE)
+
+
+def resolve_veracode_region(explicit: str | None, key_id: str | None) -> tuple[str, str | None]:
+    """(region, warning). An explicit --veracode-region wins; otherwise the
+    region is inferred from the API key id prefix, else commercial. Warns when
+    an explicit region contradicts the key id."""
+    inferred = None
+    if key_id and _VERACODE_KEY_PREFIX_RE.match(key_id.strip()):
+        inferred = _VERACODE_KEY_REGION.get(key_id.strip()[6].lower())
+    if explicit is None:
+        return inferred or "commercial", None
+    if inferred and inferred != explicit:
+        return explicit, (
+            f"--veracode-region {explicit} does not match VERACODE_API_KEY_ID, "
+            f"which looks like a {inferred} key. Using {explicit}."
+        )
+    return explicit, None
+
 
 _VALID_ORG_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
 _VALID_REPO_RE = re.compile(r"^[a-zA-Z0-9._*?\[\]-]+$")
@@ -99,17 +134,15 @@ _AUTH_FAILURE_PATTERNS = (
     "requires authentication",
 )
 
-# GraphQL can return HTTP 200 with an error body when rate limited, so exit code
-# alone is not enough. These appear in stdout on a "successful" call.
-_SILENT_ERROR_PATTERNS = (
-    "api rate limit exceeded",
-    "was submitted too quickly",
-    "secondary rate limit",
-    "\"errors\":",
-)
-
-_ACTIVE_RUN_STATES = frozenset(
-    {"queued", "in_progress", "waiting", "requested", "pending"}
+_DEFAULT_CENTRAL_REPO = "veracode"
+# Actions runs in the central repo: total_count first, then one JSON string per
+# run (display title + name) so a run can be matched to the repo it scans.
+_RUNS_JQ = '.total_count, (.workflow_runs[] | ((.display_title // "") + " " + (.name // "")) | @json)'
+# Check runs: only the completion times of runs named veracode*, nothing else
+# (check output can contain arbitrary text).
+_CHECK_RUNS_JQ = (
+    r'.check_runs[] | select((.name // "") | ascii_downcase | test("^\\s*veracode"))'
+    ' | .completed_at // empty'
 )
 
 
@@ -159,14 +192,35 @@ class CallCost:
     content: bool = False
     mutation: bool = False
     search: bool = False
+    close: bool = False
 
 
 COST_READ = CallCost(points=1)
 COST_SEARCH = CallCost(points=1, search=True)
 COST_WRITE = CallCost(points=5, mutation=True)
 COST_CONTENT = CallCost(points=5, content=True, mutation=True)
-# close + comment is two content operations in one gh call
-COST_CLOSE = CallCost(points=10, content=True, mutation=True)
+# REST PATCH state=closed: a mutation, but it creates no content, so it is not
+# charged against the content/minute and content/hour budgets.
+COST_CLOSE = CallCost(points=5, mutation=True, close=True)
+
+
+class Aborted(Exception):
+    """Raised inside a worker when the run is stopping (Ctrl-C)."""
+
+
+# Set on Ctrl-C. Workers stop before their next write; waits wake up early.
+STOP = threading.Event()
+
+
+def check_stop() -> None:
+    if STOP.is_set():
+        raise Aborted()
+
+
+def _sleep(seconds: float) -> None:
+    """Interruptible sleep: returns early once STOP is set (Ctrl-C)."""
+    if seconds > 0:
+        STOP.wait(seconds)
 
 
 class Throttle:
@@ -182,18 +236,21 @@ class Throttle:
         content_per_min: int,
         content_per_hour: int,
         search_per_min: int = GH_SEARCH_PER_MIN,
+        close_per_min: int = 0,
     ) -> None:
         self._lock = threading.Lock()
         self._points: deque[tuple[float, int]] = deque()
         self._content_min: deque[float] = deque()
         self._content_hour: deque[float] = deque()
         self._search_min: deque[float] = deque()
+        self._close_min: deque[float] = deque()
         self._last_mutation = 0.0
         self._pause_until = 0.0
         self.points_per_min = points_per_min
         self.content_per_min = content_per_min
         self.content_per_hour = content_per_hour
         self.search_per_min = search_per_min
+        self.close_per_min = close_per_min
 
     @staticmethod
     def _prune(dq: deque, now: float, period: float, key=lambda e: e) -> None:
@@ -207,6 +264,9 @@ class Throttle:
 
     def acquire(self, cost: CallCost) -> None:
         while True:
+            if STOP.is_set():
+                self._acquire_stopping(cost)
+                return
             with self._lock:
                 now = time.monotonic()
                 wait = 0.0
@@ -237,24 +297,49 @@ class Throttle:
                         if len(self._content_hour) + 1 > self.content_per_hour and self._content_hour:
                             wait = max(wait, self._content_hour[0] + 3600.0 - now)
 
+                    if cost.close and self.close_per_min > 0:
+                        self._prune(self._close_min, now, 60.0)
+                        if len(self._close_min) + 1 > self.close_per_min and self._close_min:
+                            wait = max(wait, self._close_min[0] + 60.0 - now)
+
                     if wait <= 0:
                         self._points.append((now, cost.points))
                         if cost.mutation:
                             self._last_mutation = now
                         if cost.search:
                             self._search_min.append(now)
+                        if cost.close:
+                            self._close_min.append(now)
                         if cost.content:
                             self._content_min.append(now)
                             self._content_hour.append(now)
                         return
 
-            time.sleep(min(wait, 5.0) + random.uniform(0.0, 0.15))
+            _sleep(min(wait, 5.0) + random.uniform(0.0, 0.15))
+
+    def _acquire_stopping(self, cost: CallCost) -> None:
+        """After Ctrl-C only Issues restores (and their reads) still run. Keep
+        the mutation gap, skip budgets and back-off windows so shutdown is quick."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                gap = MUTATION_MIN_GAP - (now - self._last_mutation) if cost.mutation else 0.0
+                if gap <= 0:
+                    self._points.append((now, cost.points))
+                    if cost.mutation:
+                        self._last_mutation = now
+                    return
+            time.sleep(gap)
 
 
 class CreateGate:
     """Serialises issue creation across every worker and every org: a minimum gap
     between creations plus an optional batch pause. This is what stops the
-    Workflow App from queueing hundreds of scans at once."""
+    Workflow App from queueing hundreds of scans at once.
+
+    Only successful creates/comments (record_success) count toward a batch.
+    A caller-supplied recheck runs inside the gate, right before the write, so
+    a repo that gained an issue while waiting gives its turn back."""
 
     def __init__(
         self,
@@ -263,90 +348,167 @@ class CreateGate:
         batch_pause: float = 0.0,
     ) -> None:
         self._lock = threading.Lock()
+        self._count_lock = threading.Lock()
         self._last = 0.0
         self._count = 0
+        self._pause_due = False
         self.interval = interval
         self.batch_size = batch_size
         self.batch_pause = batch_pause
 
-    def wait(self, log: "RepoLogger") -> None:
+    def wait(self, log: "RepoLogger", recheck=None) -> bool:
+        """Blocks until this caller may write. Returns False (slot not used) if
+        recheck() says the write is no longer wanted."""
         # Lock is deliberately held across the sleep: creations must be serial.
         with self._lock:
-            gap = self.interval - (time.monotonic() - self._last)
-            if gap > 0:
-                time.sleep(gap + random.uniform(0.0, 0.5))
-            self._count += 1
-            if self.batch_size and self._count % self.batch_size == 0:
+            check_stop()
+            with self._count_lock:
+                pause, self._pause_due = self._pause_due, False
+            if pause:
                 log.log(
                     f"Batch of {self.batch_size} issued. "
                     f"Draining {self.batch_pause:.0f}s before the next batch."
                 )
-                time.sleep(self.batch_pause)
+                _sleep(self.batch_pause)
+                check_stop()
+            gap = self.interval - (time.monotonic() - self._last)
+            if gap > 0:
+                _sleep(gap + random.uniform(0.0, 0.5))
+                check_stop()
+            if recheck is not None and not recheck():
+                return False
             self._last = time.monotonic()
+            return True
+
+    def record_success(self, log: "RepoLogger") -> None:
+        with self._count_lock:
+            self._count += 1
+            if self.batch_size and self._count % self.batch_size == 0:
+                self._pause_due = True
 
 
 class InflightTracker:
-    """Caps how many triggered scans may be queued or running at once. Without
-    this, a bulk run queues more Actions jobs than the org can execute, and jobs
-    age out past the 6h job / GITHUB_TOKEN lifetime and fail."""
+    """Caps how many scans may be queued or running at once. Without this, a
+    bulk run queues more Actions jobs than the org can execute, and jobs age
+    out past the 6h job / GITHUB_TOKEN lifetime and fail.
+
+    The Workflow App runs scans in the org's central repo (default
+    `veracode`), not in the scanned repo, so in-flight = queued + in_progress
+    runs there, plus slots this run reserved whose run is not visible yet.
+    reserve() is atomic: waiters are serialised, and the slot is taken before
+    the create and given back with release() if nothing was written. API
+    errors count as 'busy' (fail closed) but give up after error_timeout;
+    a full queue gives up after max_wait. Both are logged."""
 
     def __init__(
         self,
         cap: int,
         ctx: "GhContext",
-        poll_seconds: int = INFLIGHT_POLL_SECONDS,
+        poll_seconds: float = INFLIGHT_POLL_SECONDS,
+        central_repo: str = _DEFAULT_CENTRAL_REPO,
+        error_timeout: float = INFLIGHT_ERROR_TIMEOUT,
+        max_wait: float = INFLIGHT_MAX_WAIT,
+        grace: float = INFLIGHT_GRACE_SECONDS,
     ) -> None:
         self.cap = cap
         self.ctx = ctx
         self.poll_seconds = poll_seconds
-        self._lock = threading.Lock()
-        self._pending: set[str] = set()
+        self.central_repo = central_repo
+        self.error_timeout = error_timeout
+        self.max_wait = max_wait
+        self.grace = grace
+        self._wait_lock = threading.Lock()  # one waiter at a time
+        self._lock = threading.Lock()  # guards _reserved
+        # repo -> (org, confirmed_at); confirmed_at None while the write is pending
+        self._reserved: dict[str, tuple[str, float | None]] = {}
 
-    def _still_running(self, repo: str) -> bool:
-        ok, out, _ = gh_call(
-            [
-                "gh", "api", f"repos/{repo}/actions/runs",
-                "-X", "GET",
-                "-f", "event=issues",
-                "-f", "per_page=10",
-            ],
-            self.ctx,
-            cost=COST_READ,
-        )
-        if not ok:
-            return False
-        data = parse_json_safe(out, f"actions_runs repo={repo}")
-        if not isinstance(data, dict):
-            return False
-        return any(
-            run.get("status") in _ACTIVE_RUN_STATES
-            for run in (data.get("workflow_runs") or [])
-        )
-
-    def wait_for_slot(self, log: "RepoLogger") -> None:
-        if self.cap <= 0:
-            return
-        while True:
-            with self._lock:
-                pending = list(self._pending)
-            if len(pending) < self.cap:
-                return
-            finished = [r for r in pending if not self._still_running(r)]
-            with self._lock:
-                self._pending.difference_update(finished)
-                remaining = len(self._pending)
-            if remaining < self.cap:
-                return
-            log.log(
-                f"{remaining} scan(s) in flight (cap {self.cap}). "
-                f"Waiting {self.poll_seconds}s."
+    def _active_runs(self, org: str) -> tuple[int, list[str]] | None:
+        """(queued + in_progress count, run titles) in the central repo, or
+        None on any API/parse error."""
+        total = 0
+        titles: list[str] = []
+        for status in ("queued", "in_progress"):
+            ok, out, _ = gh_call(
+                [
+                    "gh", "api", f"repos/{org}/{self.central_repo}/actions/runs",
+                    "-X", "GET",
+                    "-f", f"status={status}",
+                    "-f", "per_page=100",
+                    "--jq", _RUNS_JQ,
+                ],
+                self.ctx,
+                cost=COST_READ,
             )
-            time.sleep(self.poll_seconds)
+            if not ok:
+                return None
+            lines = out.splitlines()
+            try:
+                total += int(lines[0])
+                titles.extend(str(json.loads(line)).lower() for line in lines[1:] if line.strip())
+            except (IndexError, ValueError):
+                return None
+        return total, titles
 
-    def add(self, repo: str) -> None:
-        if self.cap > 0:
-            with self._lock:
-                self._pending.add(repo)
+    def _count(self, org: str, runs: tuple[int, list[str]]) -> int:
+        total, titles = runs
+        now = time.monotonic()
+        with self._lock:
+            for repo, (r_org, confirmed) in list(self._reserved.items()):
+                if r_org.lower() != org.lower() or confirmed is None:
+                    continue
+                if now - confirmed >= self.grace or any(repo.lower() in t for t in titles):
+                    # Its run is visible (or should be by now): stop double counting.
+                    del self._reserved[repo]
+            pending = sum(1 for r_org, _ in self._reserved.values() if r_org.lower() == org.lower())
+        return total + pending
+
+    def reserve(self, org: str, repo: str, log: "RepoLogger") -> bool:
+        """Take a slot for repo. False if the wait timed out (nothing reserved)."""
+        if self.cap <= 0:
+            return True
+        where = f"{org}/{self.central_repo}"
+        with self._wait_lock:
+            start = time.monotonic()
+            first_error: float | None = None
+            while True:
+                check_stop()
+                runs = self._active_runs(org)
+                now = time.monotonic()
+                if runs is None:
+                    first_error = now if first_error is None else first_error
+                    if now - first_error >= self.error_timeout:
+                        log.warn(
+                            f"Could not read Actions runs in {where} for "
+                            f"{self.error_timeout:.0f}s. Giving up on this repo."
+                        )
+                        return False
+                    log.warn(f"Could not read Actions runs in {where}. Treating as busy.")
+                else:
+                    first_error = None
+                    in_flight = self._count(org, runs)
+                    if in_flight < self.cap:
+                        with self._lock:
+                            self._reserved[repo] = (org, None)
+                        return True
+                    log.log(
+                        f"{in_flight} scan(s) in flight in {where} (cap {self.cap}). "
+                        f"Waiting {self.poll_seconds:.0f}s."
+                    )
+                if now - start >= self.max_wait:
+                    log.warn(f"Waited {self.max_wait:.0f}s for an in-flight slot. Giving up on this repo.")
+                    return False
+                _sleep(self.poll_seconds)
+
+    def confirm(self, repo: str) -> None:
+        """The write landed: keep the slot until its run shows up."""
+        with self._lock:
+            if repo in self._reserved:
+                self._reserved[repo] = (self._reserved[repo][0], time.monotonic())
+
+    def release(self, repo: str) -> None:
+        """Nothing was written: give the slot back."""
+        with self._lock:
+            self._reserved.pop(repo, None)
 
 
 @dataclass
@@ -381,7 +543,27 @@ class OrgStats:
     commented: int = 0
     skipped_no_issues: int = 0
     deleted: int = 0
+    # create/comment write failures (create mode)
     failed: int = 0
+    would_close: int = 0
+    needs_enable: int = 0
+    enable_failed: int = 0
+    query_failed: int = 0
+    close_failed: int = 0
+    restore_failed: int = 0
+    crashed: int = 0
+    org_failed: int = 0
+    aborted: int = 0
+    stale_check_failed: int = 0
+    not_found: int = 0
+
+    @property
+    def total_failed(self) -> int:
+        return (
+            self.failed + self.enable_failed + self.query_failed + self.close_failed
+            + self.restore_failed + self.crashed + self.org_failed
+            + self.stale_check_failed + self.not_found
+        )
 
 
 @dataclass
@@ -390,6 +572,13 @@ class RepoResult:
     row: dict
     logs: list[str] = field(default_factory=list)
     stat_deltas: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DeleteOptions:
+    close_comment: str | None = None
+    issue_author: str | None = None
+    match_body: bool = False
 
 
 class RepoLogger:
@@ -502,11 +691,19 @@ def load_org_repos_from_file(file_path: str) -> list[tuple[str, str]]:
 
 
 def filter_repos_by_names(repos: list[dict], target_names: list[str]) -> list[dict]:
-    target_set = {name.lower() for name in target_names}
-    return [
-        r for r in repos
-        if r["nameWithOwner"].split("/", 1)[-1].lower() in target_set
-    ]
+    """Case-insensitive. Entries with glob characters (* ? [) match via fnmatch."""
+    exact = {name.lower() for name in target_names if not _has_glob(name)}
+    patterns = [name.lower() for name in target_names if _has_glob(name)]
+    result = []
+    for r in repos:
+        short = r["nameWithOwner"].split("/", 1)[-1].lower()
+        if short in exact or any(fnmatch.fnmatchcase(short, p) for p in patterns):
+            result.append(r)
+    return result
+
+
+def _has_glob(name: str) -> bool:
+    return any(ch in name for ch in "*?[")
 
 
 def filter_repos_by_wildcard(repos: list[dict], pattern: str) -> list[dict]:
@@ -525,11 +722,13 @@ def query_rate_limit(ctx: GhContext) -> bool:
             ["gh", "api", "rate_limit", "--jq", _RL_JQ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             env=ctx.env,
             timeout=SUBPROCESS_TIMEOUT,
         )
-        lines = result.stdout.strip().splitlines()
+        lines = (result.stdout or "").strip().splitlines()
         if len(lines) < 4:
             return False
         core_rem, core_reset, gql_rem, gql_reset = (int(x) for x in lines[:4])
@@ -577,7 +776,7 @@ def maybe_pause_for_rate_limit(ctx: GhContext) -> None:
                 file=sys.stderr,
             )
             ctx.throttle.register_block(sleep_for)
-            time.sleep(sleep_for)
+            _sleep(sleep_for)
 
 
 def _run_subprocess(
@@ -590,10 +789,14 @@ def _run_subprocess(
             args,
             capture_output=True,
             text=True,
+            # gh always emits UTF-8. Without this, Windows decodes with the
+            # ANSI code page and an undecodable byte leaves stdout as None.
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=timeout,
         )
-        return result.returncode == 0, result.stdout, result.stderr
+        return result.returncode == 0, result.stdout or "", result.stderr or ""
     except subprocess.TimeoutExpired as exc:
         partial_stderr = ""
         if exc.stderr:
@@ -615,11 +818,46 @@ def _parse_retry_after(text: str) -> int | None:
     return None
 
 
+def _graphql_error_text(stdout: str) -> str | None:
+    """GraphQL can answer HTTP 200 (exit 0) with an error body when rate
+    limited. Returns the error text if stdout is a JSON object with a
+    non-empty top-level `errors` (or a bare `message` and no `data`), else
+    None. Parsed, never substring-matched: successful output may contain any
+    text (repo names, titles)."""
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    errors = data.get("errors")
+    if isinstance(errors, list) and errors:
+        parts = []
+        for err in errors:
+            if isinstance(err, dict):
+                parts.append(f"{err.get('type') or ''} {err.get('message') or ''}".strip())
+            else:
+                parts.append(str(err))
+        return "; ".join(parts) or "errors"
+    if "data" not in data and isinstance(data.get("message"), str):
+        return data["message"]
+    return None
+
+
+def _is_graphql_call(args: list[str]) -> bool:
+    """gh repo/issue subcommands and `gh api graphql` go through GraphQL.
+    `gh api <rest path>` does not: a REST error is a non-zero exit."""
+    if len(args) < 2:
+        return False
+    if args[1] in ("repo", "issue"):
+        return True
+    return args[1] == "api" and len(args) > 2 and args[2] == "graphql"
+
+
 def _looks_silently_rate_limited(stdout: str) -> bool:
-    """GraphQL returns HTTP 200 with an error body when the primary limit is hit,
-    and 200 or 403 on secondary limits. Exit code 0 is not proof of success."""
-    lowered = stdout.lower()
-    return any(pat in lowered for pat in _SILENT_ERROR_PATTERNS)
+    """True if a successful GraphQL call's body is really a rate-limit error."""
+    text = _graphql_error_text(stdout)
+    return text is not None and _is_rate_limited(text)
 
 
 def _is_rate_limited(text: str) -> bool:
@@ -648,10 +886,15 @@ def gh_call(
         ctx.throttle.acquire(cost)
         success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
 
-        if success and not _looks_silently_rate_limited(stdout):
-            return True, stdout, stderr
-
-        combined = (stderr + stdout).lower()
+        if success:
+            # Only GraphQL can fail with exit 0. REST bodies (check runs,
+            # commit messages, titles) may mention rate limits harmlessly.
+            silent = _graphql_error_text(stdout) if _is_graphql_call(args) else None
+            if silent is None:
+                return True, stdout, stderr
+            combined = (stderr + " " + silent).lower()
+        else:
+            combined = (stderr + stdout).lower()
 
         if any(pat in combined for pat in _AUTH_FAILURE_PATTERNS):
             print(stderr, file=sys.stderr)
@@ -682,7 +925,7 @@ def gh_call(
                 file=sys.stderr,
             )
             ctx.throttle.register_block(block_for)
-            time.sleep(block_for)
+            _sleep(block_for)
             delay = min(delay * 2, SECONDARY_BACKOFF_CAP)
         elif query_rate_limit(ctx):
             with ctx.state.lock:
@@ -690,11 +933,15 @@ def gh_call(
             sleep_for = max(reset_epoch - int(time.time()) + 1, 30)
             print(f"Primary rate limit. Pausing all workers {sleep_for}s until reset...", file=sys.stderr)
             ctx.throttle.register_block(sleep_for)
-            time.sleep(sleep_for)
+            _sleep(sleep_for)
         else:
             print("Rate limited (could not query reset). Pausing all workers 30s...", file=sys.stderr)
             ctx.throttle.register_block(30)
-            time.sleep(30)
+            _sleep(30)
+
+        if STOP.is_set():
+            # Stopping: do not keep a worker retrying through a back-off.
+            return False, stdout, stderr
 
     return False, "", ""
 
@@ -753,6 +1000,8 @@ def fetch_veracode_profiles(region: str) -> set[str]:
                     timeout=VERACODE_TIMEOUT,
                 )
                 if response.status_code == 429 or response.status_code >= 500:
+                    if attempt == VERACODE_MAX_RETRIES:
+                        break  # no point sleeping before giving up
                     retry_after = response.headers.get("Retry-After")
                     try:
                         sleep_for = int(retry_after) if retry_after else VERACODE_RETRY_SLEEP * attempt
@@ -774,7 +1023,8 @@ def fetch_veracode_profiles(region: str) -> set[str]:
                     f"(attempt {attempt}/{VERACODE_MAX_RETRIES}): {exc}",
                     file=sys.stderr,
                 )
-                time.sleep(VERACODE_RETRY_SLEEP * attempt)
+                if attempt < VERACODE_MAX_RETRIES:
+                    time.sleep(VERACODE_RETRY_SLEEP * attempt)
 
         if response is None:
             raise VeracodeError(f"Veracode request failed after retries: {last_exc}")
@@ -835,7 +1085,8 @@ def _check_and_report(org: str, ctx: GhContext) -> bool:
     return ok
 
 
-def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
+def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict] | None:
+    """Repos of org, [] for an empty org, None if the list call failed."""
     success, stdout, _ = gh_call(
         [
             "gh", "repo", "list", org,
@@ -849,10 +1100,12 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
     )
     if not success:
         print(f"Error: Failed to fetch repos for org '{org}'.", file=sys.stderr)
-        return []
+        return None
     result = parse_json_safe(stdout, f"fetch_repos org={org}")
     if not isinstance(result, list):
-        return []
+        if not stdout.strip():
+            return []
+        return None
     if len(result) >= limit:
         print(
             f"Warning: org '{org}' returned {len(result)} repos, equal to --repo-limit "
@@ -862,34 +1115,104 @@ def fetch_repos(org: str, limit: int, ctx: GhContext) -> list[dict]:
     return result
 
 
-def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
-    """Lists open issues directly (REST, paginated) and matches the title exactly.
+# Same shape as _REPO_JQ, from the REST repo object.
+_ONE_REPO_JQ = (
+    "{nameWithOwner: .full_name, hasIssuesEnabled: .has_issues, "
+    "primaryLanguage: (.language // \"N/A\"), isArchived: .archived, "
+    "defaultBranch: (.default_branch // \"\")}"
+)
+REPO_NOT_FOUND = "not_found"
 
-    Deliberately NOT `gh issue list --search`: search is index-backed and lags,
-    so a just-created issue can be invisible for seconds or longer. That lag
-    let re-runs and the read-back check miss existing issues and create
-    duplicates. The REST issues list also returns pull requests (items with a
-    `pull_request` key), which are filtered out.
 
-    Returns issue numbers sorted oldest first, [] if none, None on API error."""
-    jq = (
-        f".[] | select(.pull_request == null and .title == {json.dumps(title)}) "
-        "| .number"
+def fetch_repo(full_name: str, ctx: GhContext) -> dict | str | None:
+    """One repo by name: its dict, REPO_NOT_FOUND on 404, None on other errors.
+    Exact targets are fetched this way so they are found even beyond
+    --repo-limit, and missing ones can be reported."""
+    ok, out, err = gh_call(
+        ["gh", "api", f"repos/{full_name}", "--jq", _ONE_REPO_JQ], ctx, cost=COST_READ,
     )
-    success, stdout, _ = gh_call(
-        [
-            "gh", "api", f"repos/{repo}/issues",
-            "-X", "GET",
-            "-f", "state=open",
-            "-f", "per_page=100",
-            "--paginate",
-            "--jq", jq,
-        ],
-        ctx,
-        cost=COST_READ,
-    )
-    if not success:
+    if not ok:
+        lowered = (err + out).lower()
+        if "http 404" in lowered or "not found" in lowered:
+            return REPO_NOT_FOUND
         return None
+    data = parse_json_safe(out, f"fetch_repo {full_name}")
+    if isinstance(data, dict) and data.get("nameWithOwner"):
+        return data
+    return None
+
+
+def resolve_targets(
+    org: str,
+    names: list[str],
+    limit: int,
+    ctx: GhContext,
+    skip: set[str] | None = None,
+) -> tuple[list[dict] | None, list[tuple[str, str]]]:
+    """Repos for an explicit target list (--repo-file / --org-repo-file).
+
+    Exact names are fetched directly; the org is only listed when the list has
+    glob entries (and exact names the listing missed are still fetched). skip
+    holds lower-cased org/repo names to leave out (--resume).
+
+    Returns (repos, missing) where missing is [(org/repo, action)] with action
+    'not_found' or 'failed_repo_lookup'. repos is None if a needed org listing
+    failed."""
+    skip = skip or set()
+    globs = [n for n in names if _has_glob(n)]
+    exact: list[str] = []
+    seen: set[str] = set()
+    for n in names:
+        if not _has_glob(n) and n.lower() not in seen:
+            seen.add(n.lower())
+            exact.append(n)
+
+    repos: list[dict] = []
+    if globs:
+        listing = fetch_repos(org, limit, ctx)
+        if listing is None:
+            return None, []
+        repos = filter_repos_by_names(listing, names)
+    have = {r["nameWithOwner"].split("/", 1)[-1].lower() for r in repos}
+
+    missing: list[tuple[str, str]] = []
+    for n in exact:
+        full = f"{org}/{n}"
+        if n.lower() in have or full.lower() in skip:
+            continue
+        found = fetch_repo(full, ctx)
+        if isinstance(found, dict):
+            repos.append(found)
+            have.add(n.lower())
+        else:
+            missing.append((full, "not_found" if found == REPO_NOT_FOUND else "failed_repo_lookup"))
+    return repos, missing
+
+
+def _query_open_issues(
+    repo: str,
+    title: str,
+    ctx: GhContext,
+    author: str | None = None,
+    match_body: bool = False,
+) -> tuple[list[int] | None, str]:
+    """find_open_issues plus the raw stderr, so callers can tell 'Issues are
+    disabled' (HTTP 410) apart from other errors."""
+    cond = f".pull_request == null and .title == {json.dumps(title)}"
+    if match_body:
+        cond += r' and ((.body // "") | gsub("^\\s+|\\s+$"; "")) == ' + json.dumps(ISSUE_BODY)
+    args = [
+        "gh", "api", f"repos/{repo}/issues",
+        "-X", "GET",
+        "-f", "state=open",
+        "-f", "per_page=100",
+    ]
+    if author:
+        args += ["-f", f"creator={author}"]
+    args += ["--paginate", "--jq", f".[] | select({cond}) | .number"]
+    success, stdout, stderr = gh_call(args, ctx, cost=COST_READ, timeout=PAGINATE_TIMEOUT)
+    if not success:
+        return None, stderr
     numbers: list[int] = []
     for line in stdout.split():
         try:
@@ -899,8 +1222,30 @@ def find_open_issues(repo: str, title: str, ctx: GhContext) -> list[int] | None:
                 f"Error: unexpected output from issue lookup (repo={repo}): {line[:100]!r}",
                 file=sys.stderr,
             )
-            return None
-    return sorted(set(numbers))
+            return None, stderr
+    return sorted(set(numbers)), stderr
+
+
+def find_open_issues(
+    repo: str,
+    title: str,
+    ctx: GhContext,
+    author: str | None = None,
+    match_body: bool = False,
+) -> list[int] | None:
+    """Lists open issues directly (REST, paginated) and matches the title exactly.
+
+    Deliberately NOT `gh issue list --search`: search is index-backed and lags,
+    so a just-created issue can be invisible for seconds or longer. That lag
+    let re-runs and the read-back check miss existing issues and create
+    duplicates. The REST issues list also returns pull requests (items with a
+    `pull_request` key), which are filtered out.
+
+    author filters server-side by creator; match_body also requires the body
+    to equal ISSUE_BODY (whitespace-trimmed).
+
+    Returns issue numbers sorted oldest first, [] if none, None on API error."""
+    return _query_open_issues(repo, title, ctx, author, match_body)[0]
 
 
 def verify_issue_created(repo: str, ctx: GhContext, log: RepoLogger) -> bool | None:
@@ -908,7 +1253,7 @@ def verify_issue_created(repo: str, ctx: GhContext, log: RepoLogger) -> bool | N
     a creation while still returning success. Read it back, a few times.
     True = visible, False = not visible, None = could not verify."""
     for attempt in range(1, VERIFY_ATTEMPTS + 1):
-        time.sleep(VERIFY_DELAY_SECONDS * attempt)
+        _sleep(VERIFY_DELAY_SECONDS * attempt)
         nums = find_open_issues(repo, ISSUE_TITLE, ctx)
         if nums is None:
             log.warn("Could not verify issue creation (API error).")
@@ -948,42 +1293,64 @@ def create_trigger_issue(name: str, ctx: GhContext, log: RepoLogger) -> str:
     skipped if the issue is already there.
 
     Returns the CSV action string."""
-    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-        success, stdout, stderr = gh_call(
-            [
-                "gh", "issue", "create", "--repo", name,
-                "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
-            ],
-            ctx,
-            cost=COST_CONTENT,
-            max_retries=0,
-        )
+    attempted = False
 
-        if success:
-            verified = verify_issue_created(name, ctx, log)
-            if verified is False:
-                return "failed_silent_block"
-            return "created" if verified else "created_unverified"
-
-        if not _retryable_write_failure(stdout, stderr):
-            log.log("Failed to create issue.")
-            return "failed_create"
-
-        block_for = _write_backoff(attempt, stdout, stderr)
-        log.warn(
-            f"Create hit a rate limit or timeout (attempt {attempt + 1}). "
-            f"Waiting {block_for}s, then checking whether it landed anyway."
-        )
-        ctx.throttle.register_block(block_for)
-        time.sleep(block_for)
-
+    def landed_anyway(why: str) -> bool:
+        """After an ambiguous failure: is the issue there? Errors read as no."""
         existing = find_open_issues(name, ISSUE_TITLE, ctx)
-        if existing is None:
-            log.log("Could not re-check for the issue (API error). Not retrying, to avoid a duplicate.")
-            return "failed_create_unknown"
         if existing:
-            log.log(f"Issue #{existing[0]} exists despite the error. Not creating another.")
+            log.log(f"Issue #{existing[0]} exists despite the {why}. Not creating another.")
+            return True
+        return False
+
+    try:
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            check_stop()
+            attempted = True
+            success, stdout, stderr = gh_call(
+                [
+                    "gh", "issue", "create", "--repo", name,
+                    "--title", ISSUE_TITLE, "--body", ISSUE_BODY,
+                ],
+                ctx,
+                cost=COST_CONTENT,
+                max_retries=0,
+            )
+
+            if success:
+                verified = verify_issue_created(name, ctx, log)
+                if verified is False:
+                    return "failed_silent_block"
+                return "created" if verified else "created_unverified"
+
+            if not _retryable_write_failure(stdout, stderr):
+                # A 5xx or dropped connection may still have stored the issue.
+                # Auth/permission failures cannot have.
+                if not _is_auth_failure(stderr + stdout) and landed_anyway("error"):
+                    return "created"
+                log.log("Failed to create issue.")
+                return "failed_create"
+
+            block_for = _write_backoff(attempt, stdout, stderr)
+            log.warn(
+                f"Create hit a rate limit or timeout (attempt {attempt + 1}). "
+                f"Waiting {block_for}s, then checking whether it landed anyway."
+            )
+            ctx.throttle.register_block(block_for)
+            _sleep(block_for)
+
+            existing = find_open_issues(name, ISSUE_TITLE, ctx)
+            if existing is None:
+                log.log("Could not re-check for the issue (API error). Not retrying, to avoid a duplicate.")
+                return "failed_create_unknown"
+            if existing:
+                log.log(f"Issue #{existing[0]} exists despite the error. Not creating another.")
+                return "created"
+    except Exception:
+        # Crash or Ctrl-C after a create was sent: report what really happened.
+        if attempted and landed_anyway("interruption"):
             return "created"
+        raise
 
     log.log("Failed to create issue after retries.")
     return "failed_create"
@@ -1029,6 +1396,7 @@ def comment_trigger_issue(name: str, issue: int, ctx: GhContext, log: RepoLogger
     since_ts = time.time() - COMMENT_SINCE_MARGIN_SECONDS
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        check_stop()
         success, stdout, stderr = gh_call(
             [
                 "gh", "issue", "comment", str(issue), "--repo", name,
@@ -1051,7 +1419,7 @@ def comment_trigger_issue(name: str, issue: int, ctx: GhContext, log: RepoLogger
             f"Waiting {block_for}s, then checking whether it landed anyway."
         )
         ctx.throttle.register_block(block_for)
-        time.sleep(block_for)
+        _sleep(block_for)
 
         landed = find_trigger_comments_since(name, issue, since_ts, ctx)
         if landed is None:
@@ -1065,42 +1433,46 @@ def comment_trigger_issue(name: str, issue: int, ctx: GhContext, log: RepoLogger
     return "failed_comment"
 
 
+class CheckLookupError(Exception):
+    """The last-scan lookup for --stale-days failed (API error, missing default
+    branch, unparsable output). The repo must not be treated as stale."""
+
+
 def get_last_veracode_check(repo: str, branch: str, ctx: GhContext) -> datetime | None:
-    """Note: check runs only exist for the head commit of the default branch. A
+    """Most recent completion of a check run named veracode* on the head of
+    the default branch; None if there is none. Raises CheckLookupError when
+    the lookup itself fails, so an error never reads as 'never scanned'.
+
+    Paginated, and filtered with --jq so only completion times come back.
+
+    Note: check runs only exist for the head commit of the default branch. A
     repo committed to since its last scan will report no checks and be treated
     as stale."""
     if not branch:
-        return None
+        raise CheckLookupError("no default branch (empty repository?)")
 
-    success, stdout, _ = gh_call(
+    ref = urllib.parse.quote(branch, safe="/")
+    success, stdout, stderr = gh_call(
         [
-            "gh", "api", f"repos/{repo}/commits/{branch}/check-runs",
+            "gh", "api", f"repos/{repo}/commits/{ref}/check-runs",
             "-X", "GET",
             "-f", "per_page=100",
+            "--paginate",
+            "--jq", _CHECK_RUNS_JQ,
         ],
         ctx,
         cost=COST_READ,
+        timeout=PAGINATE_TIMEOUT,
     )
     if not success:
-        return None
+        raise CheckLookupError(f"check-runs lookup failed: {stderr.strip()[:200]}")
 
-    parsed = parse_json_safe(stdout, f"get_last_veracode_check repo={repo}")
-    if not isinstance(parsed, dict):
-        return None
-
-    check_runs = parsed.get("check_runs") or []
     completed_times: list[datetime] = []
-    for run in check_runs:
-        name = (run.get("name") or "").strip().lower()
-        completed_at = run.get("completed_at")
-        if not name.startswith("veracode") or not completed_at:
-            continue
+    for line in stdout.split():
         try:
-            completed_times.append(
-                datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-            )
-        except (ValueError, AttributeError):
-            continue
+            completed_times.append(datetime.fromisoformat(line.replace("Z", "+00:00")))
+        except ValueError as exc:
+            raise CheckLookupError(f"unexpected check-runs output: {line[:100]!r}") from exc
 
     return max(completed_times) if completed_times else None
 
@@ -1161,12 +1533,142 @@ def _row_delete(
     }
 
 
+def read_has_issues(repo: str, ctx: GhContext) -> bool | None:
+    """Current has_issues setting, or None if it could not be read."""
+    ok, out, _ = gh_call(["gh", "api", f"repos/{repo}", "--jq", ".has_issues"], ctx, cost=COST_READ)
+    value = out.strip().lower() if ok else ""
+    return {"true": True, "false": False}.get(value)
+
+
 def _restore_issues_disabled(name: str, ctx: GhContext, log: RepoLogger) -> bool:
     log.log("Restoring state: Disabling issues...")
-    success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx, cost=COST_WRITE)
+    success, out, err = gh_call(["gh", "repo", "edit", name, "--enable-issues=false"], ctx, cost=COST_WRITE)
+    if not success and _retryable_write_failure(out, err) and read_has_issues(name, ctx) is False:
+        log.log("Restore errored but Issues are disabled.")
+        success = True
     if not success:
         log.warn(f"Failed to restore issues-disabled state on {name}")
     return success
+
+
+def _issues_disabled_error(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return "http 410" in lowered or "issues are disabled" in lowered
+
+
+class IssuesToggle:
+    """Temporarily enables Issues on one repo and guarantees the restore."""
+
+    def __init__(self, name: str, ctx: GhContext, log: RepoLogger) -> None:
+        self.name = name
+        self.ctx = ctx
+        self.log = log
+        self.needs_restore = False
+        self.restore_ok: bool | None = None
+
+    def enable(self) -> bool:
+        check_stop()
+        ok, out, err = gh_call(
+            ["gh", "repo", "edit", self.name, "--enable-issues"], self.ctx, cost=COST_WRITE,
+        )
+        if ok:
+            self.needs_restore = True
+            return True
+        if _retryable_write_failure(out, err):
+            # A timeout or rate-limit response may still have landed.
+            if read_has_issues(self.name, self.ctx) is not False:
+                self.log.warn("Enable errored but Issues may now be on. Restoring.")
+                self.needs_restore = True
+        return False
+
+    def restore(self) -> None:
+        if not self.needs_restore:
+            return
+        self.needs_restore = False
+        try:
+            self.restore_ok = _restore_issues_disabled(self.name, self.ctx, self.log)
+        except Exception as exc:  # noqa: BLE001 - must never escape a worker
+            self.log.warn(f"Restore crashed: {exc!r}")
+            self.restore_ok = False
+
+
+def _guard_repo(log: RepoLogger, deltas: dict[str, int], toggle: IssuesToggle, body) -> str:
+    """Runs body() -> action with the Issues restore in a finally, so no path
+    (early return, interrupt, unexpected exception) leaves Issues enabled.
+    A failed restore is appended to the action and counted on every path."""
+    try:
+        action = body()
+    except Aborted:
+        log.warn("Run interrupted. Stopped before the next write.")
+        deltas["aborted"] = 1
+        action = "aborted"
+    except Exception as exc:  # noqa: BLE001
+        log.warn(f"Unexpected error: {exc!r}")
+        deltas["crashed"] = 1
+        action = "worker_crashed"
+    finally:
+        toggle.restore()
+    if toggle.restore_ok is False:
+        deltas["restore_failed"] = 1
+        action = f"{action}_restore_failed"
+    return action
+
+
+def read_issue_state(repo: str, issue: int, ctx: GhContext) -> str | None:
+    """'open' / 'closed', or None if it could not be read."""
+    ok, out, _ = gh_call(
+        ["gh", "api", f"repos/{repo}/issues/{issue}", "--jq", ".state"],
+        ctx, cost=COST_READ,
+    )
+    state = out.strip().lower() if ok else ""
+    return state if state in ("open", "closed") else None
+
+
+def close_issue(
+    repo: str, issue: int, ctx: GhContext, log: RepoLogger, comment: str | None = None,
+) -> bool:
+    """Closes one issue via REST PATCH (state=closed, not_planned).
+
+    The PATCH is idempotent, so it may be retried (gh_call retries rate limits).
+    A timeout may have landed, so the state is read back before retrying or
+    counting the close as failed. The optional comment is a content write and
+    is sent exactly once (max_retries=0); a failed comment does not stop the
+    close."""
+    if comment:
+        ok, _, _ = gh_call(
+            [
+                "gh", "api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments",
+                "-f", f"body={comment}", "--silent",
+            ],
+            ctx, cost=COST_CONTENT, max_retries=0,
+        )
+        if not ok:
+            log.warn(f"Could not comment on issue #{issue}. Closing it anyway (comment not retried).")
+
+    for attempt in range(1, CLOSE_ATTEMPTS + 1):
+        if attempt > 1:
+            check_stop()
+        ok, out, err = gh_call(
+            [
+                "gh", "api", "-X", "PATCH", f"repos/{repo}/issues/{issue}",
+                "-f", "state=closed", "-f", "state_reason=not_planned", "--silent",
+            ],
+            ctx, cost=COST_CLOSE,
+        )
+        if ok:
+            return True
+        if not _retryable_write_failure(out, err):
+            return False
+        state = read_issue_state(repo, issue, ctx)
+        if state == "closed":
+            log.log(f"Close of #{issue} errored but the issue is closed.")
+            return True
+        if state is None:
+            log.warn(f"Close of #{issue} errored and its state could not be read back.")
+            return False
+        if attempt < CLOSE_ATTEMPTS:
+            log.warn(f"Close of #{issue} errored and it is still open. Retrying.")
+    return False
 
 
 def _process_delete_repo(
@@ -1175,7 +1677,9 @@ def _process_delete_repo(
     ctx: GhContext,
     veracode_profiles: set[str] | None,
     dry_run: bool,
+    opts: DeleteOptions | None = None,
 ) -> RepoResult:
+    opts = opts or DeleteOptions()
     name = repo["nameWithOwner"]
     issues_enabled = repo["hasIssuesEnabled"]
     log = RepoLogger(name)
@@ -1204,87 +1708,80 @@ def _process_delete_repo(
                 log.lines, deltas,
             )
 
-    if dry_run and not issues_enabled:
-        log.log("[DRY RUN] Issues disabled. Would enable, close, then re-disable.")
-        return RepoResult(
-            name,
-            _row_delete(org, repo, 0, "dry_run_needs_issues_enabled", vc_exists_str),
-            log.lines, deltas,
-        )
+    toggle = IssuesToggle(name, ctx, log)
+    closed = {"n": 0}
 
-    was_disabled = False
-    if not issues_enabled:
-        log.log("Issues are disabled. Temporarily enabling to close existing issue...")
-        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx, cost=COST_WRITE)
-        if not success:
-            log.log("Could not enable issues. Skipping.")
-            deltas["failed"] = 1
-            return RepoResult(
-                name,
-                _row_delete(org, repo, 0, "failed_enable_issues", vc_exists_str),
-                log.lines, deltas,
-            )
-        was_disabled = True
+    def body() -> str:
+        check_stop()
+        lookup = {"author": opts.issue_author, "match_body": opts.match_body}
+        # On a repo with Issues disabled the LIST endpoint answers 200 [] even
+        # when issues exist (only single-issue GETs return 410), so an empty
+        # list proves nothing there: a disabled repo is always enabled, listed,
+        # closed and restored. Repos listed as enabled are listed first; a 410
+        # (Issues turned off since the repo listing) falls back to the toggle.
+        nums: list[int] | None = None
+        needs_toggle = not issues_enabled
+        if not needs_toggle:
+            nums, err = _query_open_issues(name, ISSUE_TITLE, ctx, **lookup)
+            if nums is None and _issues_disabled_error(err):
+                needs_toggle = True
+            elif nums is None:
+                log.log("Could not query issues (API error). Skipping.")
+                deltas["query_failed"] = 1
+                return "failed_query_issues"
+            elif not nums:
+                log.log("No matching issues found.")
+                deltas["skipped_no_issues"] = 1
+                return "no_issues_found"
 
-    issue_numbers = find_open_issues(name, ISSUE_TITLE, ctx)
-    if issue_numbers is None:
-        log.log("Could not query issues (API error). Skipping.")
-        deltas["failed"] = 1
-        if was_disabled:
-            _restore_issues_disabled(name, ctx, log)
-        return RepoResult(
-            name,
-            _row_delete(org, repo, 0, "failed_query_issues", vc_exists_str),
-            log.lines, deltas,
-        )
+        if dry_run:
+            if nums:
+                deltas["would_close"] = len(nums)
+                closed["n"] = len(nums)
+            if needs_toggle:
+                deltas["needs_enable"] = 1
+                log.log("[DRY RUN] Issues disabled. Would enable, close any trigger issues, then re-disable.")
+                return "dry_run_needs_issues_enabled"
+            log.log(f"[DRY RUN] Would close issue(s): {nums}")
+            return "dry_run_would_close"
 
-    if not issue_numbers:
-        log.log("No matching issues found.")
-        deltas["skipped_no_issues"] = 1
-        if was_disabled:
-            _restore_issues_disabled(name, ctx, log)
-        return RepoResult(
-            name,
-            _row_delete(org, repo, 0, "no_issues_found", vc_exists_str),
-            log.lines, deltas,
-        )
+        if needs_toggle:
+            log.log("Issues are disabled. Temporarily enabling to find and close trigger issues...")
+            if not toggle.enable():
+                log.log("Could not enable issues. Skipping.")
+                deltas["enable_failed"] = 1
+                return "failed_enable_issues"
+            if nums is None:
+                nums, _ = _query_open_issues(name, ISSUE_TITLE, ctx, **lookup)
+                if nums is None:
+                    log.log("Could not query issues (API error). Skipping.")
+                    deltas["query_failed"] = 1
+                    return "failed_query_issues"
+                if not nums:
+                    log.log("No matching issues found.")
+                    deltas["skipped_no_issues"] = 1
+                    return "no_issues_found"
 
-    if dry_run:
-        log.log(f"[DRY RUN] Would close issue(s): {issue_numbers}")
-        return RepoResult(
-            name,
-            _row_delete(org, repo, len(issue_numbers), "dry_run_would_close", vc_exists_str),
-            log.lines, deltas,
-        )
+        failed = 0
+        for issue_num in nums:
+            check_stop()
+            log.log(f"Closing issue #{issue_num}...")
+            if close_issue(name, issue_num, ctx, log, opts.close_comment):
+                closed["n"] += 1
+                deltas["deleted"] = deltas.get("deleted", 0) + 1
+            else:
+                log.log(f"Failed to close issue #{issue_num}")
+                failed += 1
+                deltas["close_failed"] = deltas.get("close_failed", 0) + 1
 
-    issues_deleted = issues_failed = 0
-    for issue_num in issue_numbers:
-        log.log(f"Closing issue #{issue_num}...")
-        success, _, _ = gh_call(
-            [
-                "gh", "issue", "close", str(issue_num), "--repo", name,
-                "--comment", "Closed by cleanup script",
-            ],
-            ctx,
-            cost=COST_CLOSE,
-        )
-        if success:
-            issues_deleted += 1
-            deltas["deleted"] = deltas.get("deleted", 0) + 1
-        else:
-            log.log(f"Failed to close issue #{issue_num}")
-            issues_failed += 1
-            deltas["failed"] = deltas.get("failed", 0) + 1
+        if failed == 0:
+            return "deleted"
+        return "partial_delete" if closed["n"] else "failed_close"
 
-    action = "partial_delete" if issues_failed > 0 else "deleted"
-
-    if was_disabled:
-        if not _restore_issues_disabled(name, ctx, log):
-            action = f"{action}_restore_failed"
-
+    action = _guard_repo(log, deltas, toggle, body)
     return RepoResult(
         name,
-        _row_delete(org, repo, issues_deleted, action, vc_exists_str),
+        _row_delete(org, repo, closed["n"], action, vc_exists_str),
         log.lines, deltas,
     )
 
@@ -1341,7 +1838,17 @@ def _process_create_repo(
     if check_stale:
         log.log(f"Checking for Veracode checks in the last {stale_days} days...")
         default_branch = repo.get("defaultBranch") or ""
-        last_check = get_last_veracode_check(name, default_branch, ctx)
+        try:
+            last_check = get_last_veracode_check(name, default_branch, ctx)
+        except CheckLookupError as exc:
+            # Fail closed: an unknown scan date must not trigger a scan.
+            log.warn(f"Could not determine the last Veracode check ({exc}). Skipping.")
+            deltas["stale_check_failed"] = 1
+            return RepoResult(
+                name,
+                _row_create(org, repo, "failed_stale_check", vc_exists_str),
+                log.lines, deltas,
+            )
         days_since = calculate_days_since(last_check)
 
         if last_check:
@@ -1368,6 +1875,7 @@ def _process_create_repo(
 
     if dry_run and not issues_enabled:
         log.log("[DRY RUN] Issues disabled. Would enable, create, then re-disable.")
+        deltas["needs_enable"] = 1
         return RepoResult(
             name,
             _row_create(
@@ -1377,123 +1885,108 @@ def _process_create_repo(
             log.lines, deltas,
         )
 
-    was_disabled = False
-    if not issues_enabled:
-        log.log("Issues are disabled. Temporarily enabling...")
-        success, _, _ = gh_call(["gh", "repo", "edit", name, "--enable-issues"], ctx, cost=COST_WRITE)
-        if not success:
-            log.log("Could not enable issues. Skipping issue creation.")
-            deltas["skipped_perm"] = 1
-            return RepoResult(
-                name,
-                _row_create(
-                    org, repo, "skipped_cant_enable_issues",
-                    vc_exists_str, last_check_date, days_since_check,
-                ),
-                log.lines, deltas,
+    toggle = IssuesToggle(name, ctx, log)
+
+    def body() -> str:
+        check_stop()
+        if not issues_enabled:
+            log.log("Issues are disabled. Temporarily enabling...")
+            if not toggle.enable():
+                log.log("Could not enable issues. Skipping issue creation.")
+                deltas["skipped_perm"] = 1
+                return "skipped_cant_enable_issues"
+
+        existing_issues = find_open_issues(name, ISSUE_TITLE, ctx)
+
+        if existing_issues is None:
+            log.log("Could not query existing issues (API error). Skipping to avoid duplicates.")
+            deltas["query_failed"] = 1
+            return "failed_query_issues"
+
+        if len(existing_issues) > 1:
+            log.warn(
+                f"{len(existing_issues)} open '{ISSUE_TITLE}' issues already exist "
+                f"(#{', #'.join(map(str, existing_issues))}). Duplicates from an earlier run."
             )
-        was_disabled = True
 
-    existing_issues = find_open_issues(name, ISSUE_TITLE, ctx)
+        if existing_issues and not rescan_existing:
+            log.log(f"Open trigger issue #{existing_issues[0]} already exists. Skipping.")
+            deltas["skipped_existing"] = 1
+            return "skipped_existing_issue"
 
-    if existing_issues is None:
-        log.log("Could not query existing issues (API error). Skipping to avoid duplicates.")
-        deltas["failed"] = 1
-        if was_disabled:
-            _restore_issues_disabled(name, ctx, log)
-        return RepoResult(
-            name,
-            _row_create(
-                org, repo, "failed_query_issues",
-                vc_exists_str, last_check_date, days_since_check,
-            ),
-            log.lines, deltas,
-        )
-
-    if len(existing_issues) > 1:
-        log.warn(
-            f"{len(existing_issues)} open '{ISSUE_TITLE}' issues already exist "
-            f"(#{', #'.join(map(str, existing_issues))}). Duplicates from an earlier run."
-        )
-
-    if existing_issues and not rescan_existing:
-        log.log(f"Open trigger issue #{existing_issues[0]} already exists. Skipping.")
-        deltas["skipped_existing"] = 1
-        if was_disabled:
-            _restore_issues_disabled(name, ctx, log)
-        return RepoResult(
-            name,
-            _row_create(
-                org, repo, "skipped_existing_issue",
-                vc_exists_str, last_check_date, days_since_check,
-            ),
-            log.lines, deltas,
-        )
-
-    if dry_run:
-        if existing_issues:
-            log.log(f"[DRY RUN] Would comment on existing issue #{existing_issues[0]} to rescan.")
-            deltas["commented"] = 1
-            action = "dry_run_would_comment"
-        else:
+        if dry_run:
+            if existing_issues:
+                log.log(f"[DRY RUN] Would comment on existing issue #{existing_issues[0]} to rescan.")
+                deltas["commented"] = 1
+                return "dry_run_would_comment"
             log.log("[DRY RUN] Would create issue.")
             deltas["created"] = 1
-            action = "dry_run_would_create"
-    else:
-        inflight.wait_for_slot(log)
-        gate.wait(log)
+            return "dry_run_would_create"
 
-        if not existing_issues:
-            # The slot wait can be long (batch pause, in-flight cap). Re-check
-            # right before writing so an issue opened meanwhile (another run,
-            # a person) is not duplicated.
-            recheck = find_open_issues(name, ISSUE_TITLE, ctx)
-            if recheck is None:
+        def recheck() -> str | None:
+            """The waits can be long (in-flight cap, batch pause, gate). Look
+            again so an issue opened meanwhile (another run, a person) is not
+            duplicated. None = go ahead, else the action to record."""
+            nonlocal existing_issues
+            if existing_issues:
+                return None  # commenting on a known issue; nothing to duplicate
+            found = find_open_issues(name, ISSUE_TITLE, ctx)
+            if found is None:
                 log.log("Could not re-check existing issues (API error). Skipping to avoid duplicates.")
-                recheck_action = "failed_query_issues"
-            elif recheck and not rescan_existing:
-                log.log(f"Trigger issue #{recheck[0]} appeared while waiting. Skipping.")
-                recheck_action = "skipped_existing_issue"
+                deltas["query_failed"] = 1
+                return "failed_query_issues"
+            if found and not rescan_existing:
+                log.log(f"Trigger issue #{found[0]} appeared while waiting. Skipping.")
+                deltas["skipped_existing"] = 1
+                return "skipped_existing_issue"
+            existing_issues = found
+            return None
+
+        if not inflight.reserve(org, name, log):
+            deltas["failed"] = 1
+            return "failed_inflight_wait"
+        action = "aborted"
+        try:
+            early = recheck()  # before queueing for the gate
+            if early is not None:
+                action = early
+                return action
+            inside: dict[str, str | None] = {}
+
+            def gate_check() -> bool:
+                inside["action"] = recheck()  # once more, right before writing
+                return inside["action"] is None
+
+            if not gate.wait(log, recheck=gate_check):
+                action = inside["action"] or "failed_query_issues"
+                return action
+            check_stop()
+
+            if existing_issues:
+                target = existing_issues[0]
+                log.log(f"Commenting on existing issue #{target} to rescan...")
+                action = comment_trigger_issue(name, target, ctx, log)
             else:
-                recheck_action = None
-                existing_issues = recheck
-
-            if recheck_action is not None:
-                if recheck_action == "failed_query_issues":
-                    deltas["failed"] = 1
-                else:
-                    deltas["skipped_existing"] = 1
-                if was_disabled:
-                    _restore_issues_disabled(name, ctx, log)
-                return RepoResult(
-                    name,
-                    _row_create(
-                        org, repo, recheck_action,
-                        vc_exists_str, last_check_date, days_since_check,
-                    ),
-                    log.lines, deltas,
-                )
-
-        if existing_issues:
-            target = existing_issues[0]
-            log.log(f"Commenting on existing issue #{target} to rescan...")
-            action = comment_trigger_issue(name, target, ctx, log)
-        else:
-            log.log("Creating issue...")
-            action = create_trigger_issue(name, ctx, log)
+                log.log("Creating issue...")
+                action = create_trigger_issue(name, ctx, log)
+        finally:
+            if action in ("created", "created_unverified", "commented_existing"):
+                inflight.confirm(name)
+                gate.record_success(log)
+            elif action.endswith("_unknown"):
+                inflight.confirm(name)  # may have landed: keep the slot counted
+            else:
+                inflight.release(name)
 
         if action in ("created", "created_unverified"):
-            inflight.add(name)
             deltas["created"] = 1
         elif action == "commented_existing":
-            inflight.add(name)
             deltas["commented"] = 1
         else:
             deltas["failed"] = 1
+        return action
 
-    if was_disabled:
-        if not _restore_issues_disabled(name, ctx, log):
-            action = f"{action}_restore_failed"
+    action = _guard_repo(log, deltas, toggle, body)
 
     return RepoResult(
         name,
@@ -1510,6 +2003,80 @@ def _apply_deltas(stats: OrgStats, deltas: dict[str, int]) -> None:
         setattr(stats, key, getattr(stats, key) + value)
 
 
+def _org_row(org: str, action: str) -> dict:
+    """Org-level CSV row (empty repo column) for org failures."""
+    return {"org": org, "repo": "", "action": action}
+
+
+# Cells starting with these are run as formulas by Excel/Sheets.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", chr(9), chr(13))
+
+
+def _csv_safe(value):
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _csv_unsafe(value: str) -> str:
+    if value.startswith("'") and value[1:].startswith(_FORMULA_PREFIXES):
+        return value[1:]
+    return value
+
+
+def _write_row(csv_writer: csv.DictWriter, csv_file, csv_lock: threading.Lock, row: dict) -> None:
+    """One row, formula-safe, written and flushed under the lock so a crash
+    loses nothing."""
+    safe = {key: _csv_safe(value) for key, value in row.items()}
+    with csv_lock:
+        csv_writer.writerow(safe)
+        csv_file.flush()
+
+
+# Rows with these actions are done; --resume skips the repo. A "_restore_failed"
+# suffix keeps the base action's meaning (the restore needs manual cleanup).
+TERMINAL_ACTIONS = frozenset({
+    "deleted", "no_issues_found", "skipped_archived", "skipped_veracode_profile_exists",
+    "created", "created_unverified", "commented_existing", "skipped_existing_issue",
+    "skipped_recent_check",
+})
+_RESTORE_FAILED_SUFFIX = "_restore_failed"
+
+
+def is_terminal_action(action: str) -> bool:
+    if action.endswith(_RESTORE_FAILED_SUFFIX):
+        action = action[: -len(_RESTORE_FAILED_SUFFIX)]
+    return action in TERMINAL_ACTIONS
+
+
+def default_output_name(delete_mode: bool, dry_run: bool, now: datetime | None = None) -> str:
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    mode = "delete" if delete_mode else "create"
+    return f"vcbaseline-{mode}{'-dryrun' if dry_run else ''}-{stamp}.csv"
+
+
+class ResumeError(Exception):
+    pass
+
+
+def load_resume(path: str, fieldnames: list[str]) -> set[str]:
+    """Lower-cased org/repo names that already reached a terminal action."""
+    if not os.path.isfile(path):
+        raise ResumeError(f"--resume file not found: {path}")
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames != fieldnames:
+            raise ResumeError(
+                f"--resume file '{path}' has columns {reader.fieldnames}, expected "
+                f"{fieldnames}. Was it written in the other mode?"
+            )
+        return {
+            _csv_unsafe(row["repo"]).lower()
+            for row in reader
+            if row.get("repo") and is_terminal_action(row.get("action") or "")
+        }
+
+
 def _drive_workers(
     org: str,
     repos: list[dict],
@@ -1520,46 +2087,75 @@ def _drive_workers(
     worker_fn,
 ) -> OrgStats:
     """Run worker_fn across repos with ThreadPoolExecutor. Aggregate stats and
-    flush per-repo logs atomically as each future completes."""
+    flush per-repo logs and CSV rows as each future completes.
+
+    First Ctrl-C: set STOP, cancel repos not yet started, and keep draining the
+    running ones (they stop before their next write, restore Issues and return
+    an 'aborted' row) so every touched repo reaches the CSV. Returns normally;
+    callers check STOP. A second Ctrl-C aborts the drain."""
     stats = OrgStats(org=org)
     total = len(repos)
     completed = 0
 
+    def consume(future, repo_name: str) -> None:
+        nonlocal completed
+        completed += 1
+        try:
+            result: RepoResult = future.result()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"\n[{completed}/{total}] {repo_name}\n"
+                f"  WORKER CRASHED: {exc}",
+                file=sys.stderr,
+            )
+            stats.total_repos += 1
+            stats.crashed += 1
+            _write_row(
+                csv_writer, csv_file, csv_lock,
+                {"org": org, "repo": repo_name, "action": "worker_crashed"},
+            )
+            return
+
+        block = [f"\n[{completed}/{total}] {result.repo_name}"]
+        block.extend(f"  {line}" for line in result.logs)
+        print("\n".join(block))
+
+        _apply_deltas(stats, result.stat_deltas)
+        _write_row(csv_writer, csv_file, csv_lock, result.row)
+
     executor = ThreadPoolExecutor(max_workers=workers)
+    hard_abort = False
     try:
         future_to_repo = {executor.submit(worker_fn, repo): repo for repo in repos}
-
-        for future in as_completed(future_to_repo):
-            repo = future_to_repo[future]
-            completed += 1
-            repo_name = repo["nameWithOwner"]
-
+        pending = set(future_to_repo)
+        consumed: set = set()
+        while pending:
             try:
-                result: RepoResult = future.result()
-            except Exception as exc:
+                # Short timeout keeps Ctrl-C responsive on Windows.
+                done, pending = wait_futures(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if not future.cancelled() and future not in consumed:
+                        consume(future, future_to_repo[future]["nameWithOwner"])
+                        consumed.add(future)
+            except KeyboardInterrupt:
+                if STOP.is_set():
+                    raise
+                STOP.set()
                 print(
-                    f"\n[{completed}/{total}] {repo_name}\n"
-                    f"  WORKER CRASHED: {exc}",
+                    "\nInterrupted. Stopping workers before their next write and "
+                    "restoring Issues settings. Press Ctrl-C again to abort now.",
                     file=sys.stderr,
                 )
-                stats.failed += 1
-                continue
-
-            block = [f"\n[{completed}/{total}] {result.repo_name}"]
-            block.extend(f"  {line}" for line in result.logs)
-            print("\n".join(block))
-
-            _apply_deltas(stats, result.stat_deltas)
-
-            with csv_lock:
-                csv_writer.writerow(result.row)
-                csv_file.flush()
+                for future in future_to_repo:
+                    future.cancel()
+                pending = {
+                    f for f in future_to_repo if not f.cancelled() and f not in consumed
+                }
     except KeyboardInterrupt:
-        # Without cancel_futures the pool waits for every queued repo on Ctrl-C.
-        executor.shutdown(wait=False, cancel_futures=True)
+        hard_abort = True
         raise
-    else:
-        executor.shutdown(wait=True)
+    finally:
+        executor.shutdown(wait=not hard_abort, cancel_futures=True)
 
     return stats
 
@@ -1574,11 +2170,12 @@ def run_delete_mode(
     veracode_profiles: set[str] | None,
     workers: int,
     dry_run: bool,
+    opts: DeleteOptions | None = None,
 ) -> OrgStats:
     check_veracode = veracode_profiles is not None
 
     def worker(repo: dict) -> RepoResult:
-        return _process_delete_repo(org, repo, ctx, veracode_profiles, dry_run)
+        return _process_delete_repo(org, repo, ctx, veracode_profiles, dry_run, opts)
 
     stats = _drive_workers(org, repos, csv_writer, csv_file, csv_lock, workers, worker)
 
@@ -1590,8 +2187,18 @@ def run_delete_mode(
     if check_veracode:
         print(f"Skipped VC Profile Hits:       {stats.skipped_veracode_profile}")
     print(f"Repositories with No Issues:   {stats.skipped_no_issues}")
-    print(f"Issues Closed:                 {stats.deleted}")
-    print(f"Failed Closes:                 {stats.failed}")
+    if dry_run:
+        print(f"Would Close (issues):          {stats.would_close}")
+        print(f"Would Enable Issues (repos):   {stats.needs_enable}")
+    else:
+        print(f"Issues Closed:                 {stats.deleted}")
+    print(f"Failed Closes:                 {stats.close_failed}")
+    print(f"Failed Enables:                {stats.enable_failed}")
+    print(f"Failed Queries:                {stats.query_failed}")
+    print(f"Failed Restores:               {stats.restore_failed}")
+    print(f"Crashed:                       {stats.crashed}")
+    if stats.aborted:
+        print(f"Aborted (Ctrl-C):              {stats.aborted}")
     print("----------------------------------------------------------------")
 
     return stats
@@ -1637,6 +2244,15 @@ def run_create_mode(
     print(f"Created Issues:           {stats.created}")
     print(f"Commented Existing:       {stats.commented}")
     print(f"Failed Creates/Comments:  {stats.failed}")
+    print(f"Failed Queries:           {stats.query_failed}")
+    if stale_days:
+        print(f"Failed Stale Checks:      {stats.stale_check_failed}")
+    print(f"Failed Restores:          {stats.restore_failed}")
+    print(f"Crashed:                  {stats.crashed}")
+    if dry_run:
+        print(f"Would Enable Issues:      {stats.needs_enable}")
+    if stats.aborted:
+        print(f"Aborted (Ctrl-C):         {stats.aborted}")
     print("----------------------------------------------------------------")
 
     return stats
@@ -1655,19 +2271,29 @@ def print_multi_org_summary(
     stale_days: int | None,
     check_veracode: bool,
     output_file: str,
+    dry_run: bool = False,
 ) -> None:
     print(f"\n{'=' * 64}")
-    print("MULTI-ORG SUMMARY")
+    print("RUN SUMMARY")
     print(f"{'=' * 64}")
 
     if delete_mode:
         cols = [
             ("Org", "<30", lambda s: s.org),
             ("Repos", ">6", lambda s: s.total_repos),
-            ("Closed", ">8", lambda s: s.deleted),
-            ("Failed", ">8", lambda s: s.failed),
+        ]
+        if dry_run:
+            cols += [
+                ("WouldClose", ">10", lambda s: s.would_close),
+                ("NeedEnable", ">10", lambda s: s.needs_enable),
+            ]
+        else:
+            cols.append(("Closed", ">8", lambda s: s.deleted))
+        cols += [
             ("Archived", ">9", lambda s: s.archived),
             ("No Issues", ">10", lambda s: s.skipped_no_issues),
+            ("CloseFail", ">9", lambda s: s.close_failed),
+            ("EnableFail", ">10", lambda s: s.enable_failed),
         ]
         if check_veracode:
             cols.append(("VCProf", ">7", lambda s: s.skipped_veracode_profile))
@@ -1682,11 +2308,21 @@ def print_multi_org_summary(
             ("Skipped", ">8", lambda s: s.skipped_existing),
             ("PermSkip", ">9", lambda s: s.skipped_perm),
         ]
+        if dry_run:
+            cols.append(("NeedEnable", ">10", lambda s: s.needs_enable))
         if check_veracode:
             cols.append(("VCProf", ">7", lambda s: s.skipped_veracode_profile))
         if stale_days:
             cols.append(("Recent", ">7", lambda s: s.skipped_recent))
+            cols.append(("StaleFail", ">9", lambda s: s.stale_check_failed))
         cols.append(("IaC", ">5", lambda s: s.iac))
+    cols += [
+        ("QueryFail", ">9", lambda s: s.query_failed),
+        ("NotFound", ">8", lambda s: s.not_found),
+        ("RestoreFail", ">11", lambda s: s.restore_failed),
+        ("Crashed", ">7", lambda s: s.crashed),
+        ("OrgFail", ">7", lambda s: s.org_failed),
+    ]
 
     header = " ".join(f"{name:{fmt}}" for name, fmt, _ in cols)
     sep = "-" * len(header)
@@ -1701,11 +2337,14 @@ def print_multi_org_summary(
     ]
     print(" ".join(f"{val:{fmt}}" for (_, fmt, _), val in zip(cols, totals)))
 
-    print(f"\nCSV Output: {output_file}")
+    failed = sum(s.total_failed for s in all_stats)
+    aborted = sum(s.aborted for s in all_stats)
+    print(f"\nFailures (incl. restore/org): {failed}" + (f"   Aborted: {aborted}" if aborted else ""))
+    print(f"CSV Output: {output_file}")
     print(f"{'=' * 64}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Create or close Veracode baseline scan trigger issues across one or more GitHub orgs."
@@ -1775,8 +2414,11 @@ def main() -> None:
     parser.add_argument(
         "--veracode-region",
         choices=sorted(VERACODE_REGIONS.keys()),
-        default="commercial",
-        help="Veracode region for the API base URL (default: commercial)",
+        default=None,
+        help=(
+            "Veracode region for the API base URL. Default: inferred from the "
+            "VERACODE_API_KEY_ID prefix, else commercial."
+        ),
     )
     parser.add_argument(
         "--workers",
@@ -1824,17 +2466,45 @@ def main() -> None:
         default=0,
         metavar="N",
         help=(
-            "Do not create a new issue while N triggered scans are still queued "
-            "or running (0 = off). Stops Actions jobs aging out past the 6h "
-            "job / GITHUB_TOKEN lifetime."
+            "Do not create a new issue while N scans are queued or running in "
+            "the org's central repo (see --central-repo; 0 = off). Stops Actions "
+            "jobs aging out past the 6h job / GITHUB_TOKEN lifetime."
+        ),
+    )
+    parser.add_argument(
+        "--central-repo",
+        metavar="NAME",
+        default=_DEFAULT_CENTRAL_REPO,
+        help=(
+            "Repo in each org where the Workflow App runs scans; --max-inflight "
+            f"counts its queued and in-progress Actions runs (default: {_DEFAULT_CENTRAL_REPO})"
         ),
     )
     parser.add_argument("--hostname", metavar="HOSTNAME", default=None, help="GitHub hostname for GHES/GHEC")
     parser.add_argument(
         "--output",
         metavar="FILE",
-        default=DEFAULT_OUTPUT_FILE,
-        help=f"Output CSV path (default: {DEFAULT_OUTPUT_FILE})",
+        default=None,
+        help=(
+            "Output CSV path (default: vcbaseline-<create|delete>[-dryrun]-"
+            "<YYYYmmdd-HHMMSS>.csv). An existing file is never overwritten "
+            "unless --overwrite is given."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow --output to replace an existing file",
+    )
+    parser.add_argument(
+        "--resume",
+        metavar="CSV",
+        default=None,
+        help=(
+            "Continue a previous run: skip repos whose row in CSV has a terminal "
+            "action (deleted, no_issues_found, created, skipped_*, ...) and "
+            "append new rows to that CSV"
+        ),
     )
     parser.add_argument(
         "--repo-limit",
@@ -1856,7 +2526,82 @@ def main() -> None:
         metavar="N",
         help=f"Query the rate limit every N gh calls (default: {CORE_CHECK_EVERY})",
     )
+    parser.add_argument(
+        "--close-comment",
+        metavar="TEXT",
+        default=None,
+        help=(
+            "Delete mode: post TEXT as a comment before closing each issue. Off by "
+            "default; each comment is a content write (slow: ~140/hour budget)."
+        ),
+    )
+    parser.add_argument(
+        "--close-per-minute",
+        type=int,
+        default=DEFAULT_CLOSE_PER_MINUTE,
+        metavar="N",
+        help=(
+            f"Delete mode: max issue closes per minute, global (default: "
+            f"{DEFAULT_CLOSE_PER_MINUTE}). All mutations also keep a 1s gap."
+        ),
+    )
+    parser.add_argument(
+        "--issue-author",
+        metavar="LOGIN",
+        default=None,
+        help="Delete mode: only close trigger issues opened by LOGIN",
+    )
+    parser.add_argument(
+        "--match-body",
+        action="store_true",
+        help=f"Delete mode: only close trigger issues whose body is exactly '{ISSUE_BODY}'",
+    )
+    parser.add_argument(
+        "--strict-orgs",
+        action="store_true",
+        help=(
+            "Check access to every org before any work and abort if one fails "
+            "(old behaviour). Default: inaccessible orgs are recorded and skipped."
+        ),
+    )
+    return parser
 
+
+def _warn_mode_flags(args: argparse.Namespace) -> None:
+    """Flags that do nothing in the chosen mode are almost always a mistake
+    (e.g. pacing flags passed to --delete), so say so instead of ignoring them."""
+    if args.delete:
+        used = [
+            flag for flag, on in (
+                ("--rescan-existing", args.rescan_existing),
+                ("--create-interval", args.create_interval != DEFAULT_CREATE_INTERVAL),
+                ("--batch-size", args.batch_size != 0),
+                ("--batch-pause", args.batch_pause != DEFAULT_BATCH_PAUSE),
+                ("--max-inflight", args.max_inflight != 0),
+                ("--central-repo", args.central_repo != _DEFAULT_CENTRAL_REPO),
+            ) if on
+        ]
+        if used:
+            print(
+                f"Warning: {', '.join(used)} ignored in delete mode "
+                "(delete pacing: --close-per-minute).",
+                file=sys.stderr,
+            )
+    else:
+        used = [
+            flag for flag, on in (
+                ("--close-comment", args.close_comment is not None),
+                ("--close-per-minute", args.close_per_minute != DEFAULT_CLOSE_PER_MINUTE),
+                ("--issue-author", args.issue_author is not None),
+                ("--match-body", args.match_body),
+            ) if on
+        ]
+        if used:
+            print(f"Warning: {', '.join(used)} only apply to --delete; ignored.", file=sys.stderr)
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.stale_days is not None and args.stale_days < 0:
@@ -1875,12 +2620,40 @@ def main() -> None:
         sys.exit("Error: --min-remaining must be >= 0")
     if args.rl_check_every < 1:
         sys.exit("Error: --rl-check-every must be >= 1")
+    if args.close_per_minute < 0:
+        sys.exit("Error: --close-per-minute must be >= 0")
+    if not validate_repo_name(args.central_repo) or _has_glob(args.central_repo):
+        sys.exit(f"Error: Invalid --central-repo: {args.central_repo!r}")
     if args.org_repo_file and (args.repo_file or args.repo_wildcard):
         sys.exit(
             "Error: --org-repo-file cannot be combined with --repo-file or --repo-wildcard"
         )
     if args.delete and args.stale_days is not None:
         print("Warning: --stale-days is ignored in delete mode.", file=sys.stderr)
+    _warn_mode_flags(args)
+
+    # Settle the audit CSV before any GitHub call: never clobber a previous run.
+    fieldnames = DELETE_FIELDNAMES if args.delete else CREATE_FIELDNAMES
+    resume_done: set[str] = set()
+    if args.resume:
+        if args.dry_run:
+            sys.exit("Error: --resume cannot be combined with --dry-run")
+        if args.output and os.path.abspath(args.output) != os.path.abspath(args.resume):
+            sys.exit("Error: --resume appends to its own CSV; drop --output")
+        try:
+            resume_done = load_resume(args.resume, fieldnames)
+        except ResumeError as exc:
+            sys.exit(f"Error: {exc}")
+        output_file, open_mode = args.resume, "a"
+        print(f"Resuming '{output_file}': {len(resume_done)} repo(s) already done will be skipped.")
+    else:
+        output_file = args.output or default_output_name(args.delete, args.dry_run)
+        if os.path.exists(output_file) and not args.overwrite:
+            sys.exit(
+                f"Error: '{output_file}' already exists. Use --resume to continue "
+                "that run, --overwrite to replace it, or another --output."
+            )
+        open_mode = "w" if args.overwrite else "x"
 
     if shutil.which("gh") is None:
         sys.exit("Error: GitHub CLI (gh) is not installed.")
@@ -1908,6 +2681,7 @@ def main() -> None:
         content_per_min=GH_CONTENT_PER_MIN,
         content_per_hour=GH_CONTENT_PER_HOUR,
         search_per_min=GH_SEARCH_PER_MIN,
+        close_per_min=args.close_per_minute,
     )
 
     ctx = GhContext(
@@ -1923,7 +2697,12 @@ def main() -> None:
         batch_size=args.batch_size,
         batch_pause=args.batch_pause,
     )
-    inflight = InflightTracker(cap=args.max_inflight, ctx=ctx)
+    inflight = InflightTracker(cap=args.max_inflight, ctx=ctx, central_repo=args.central_repo)
+    delete_opts = DeleteOptions(
+        close_comment=args.close_comment,
+        issue_author=args.issue_author,
+        match_body=args.match_body,
+    )
 
     repo_filter_names: list[str] | None = None
     repo_filter_pattern: str | None = None
@@ -1969,18 +2748,25 @@ def main() -> None:
     veracode_profiles: set[str] | None = None
     use_veracode = args.veracode_skip_existing
     if use_veracode:
+        region, region_warning = resolve_veracode_region(
+            args.veracode_region, os.environ.get("VERACODE_API_KEY_ID"),
+        )
+        if region_warning:
+            print(f"Warning: {region_warning}", file=sys.stderr)
+        args.veracode_region = region
         try:
-            veracode_profiles = fetch_veracode_profiles(args.veracode_region)
+            veracode_profiles = fetch_veracode_profiles(region)
         except VeracodeError as exc:
             sys.exit(f"Error: Veracode profile fetch failed: {exc}")
 
-    print("\nChecking access to all organizations...")
-    inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx)]
-    if inaccessible_orgs:
-        sys.exit(
-            f"\nError: Cannot access org(s): {', '.join(inaccessible_orgs)}. "
-            "Fix access or remove them and retry."
-        )
+    if args.strict_orgs:
+        print("\nChecking access to all organizations (--strict-orgs)...")
+        inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx)]
+        if inaccessible_orgs:
+            sys.exit(
+                f"\nError: Cannot access org(s): {', '.join(inaccessible_orgs)}. "
+                "Fix access or remove them and retry."
+            )
     print()
 
     if args.dry_run:
@@ -2030,69 +2816,127 @@ def main() -> None:
             print(f"VERACODE SKIP MODE: Skipping repos with existing profiles ({args.veracode_region})")
             print("================================================================\n")
 
-    output_file = args.output
     all_stats: list[OrgStats] = []
     csv_lock = threading.Lock()
 
-    if os.path.exists(output_file):
-        print(f"Warning: '{output_file}' already exists and will be overwritten.", file=sys.stderr)
+    def run_org(org: str, csv_writer: csv.DictWriter, csv_file) -> OrgStats:
+        targets: list[str] | None = None
+        if org_repo_pairs:
+            targets = [repo for o, repo in org_repo_pairs if o.lower() == org.lower()]
+        elif repo_filter_names:
+            targets = repo_filter_names
 
+        missing: list[tuple[str, str]] = []
+        org_action: str | None = None
+        if targets is not None:
+            repos, missing = resolve_targets(org, targets, args.repo_limit, ctx, resume_done)
+            if repos is not None and not repos and missing and not check_org_access(org, ctx):
+                # Every target 404'd because the org itself is out of reach.
+                repos, missing, org_action = None, [], "org_inaccessible"
+        else:
+            repos = fetch_repos(org, args.repo_limit, ctx)
+        if repos is None:
+            # Only now spend a call to tell "no access" from "list failed".
+            action = org_action or ("org_list_failed" if check_org_access(org, ctx) else "org_inaccessible")
+            print(f"  Error: {action} for '{org}'. Continuing with the next org.", file=sys.stderr)
+            _write_row(csv_writer, csv_file, csv_lock, _org_row(org, action))
+            return OrgStats(org=org, org_failed=1)
+
+        for full, action in missing:
+            print(f"  Error: {full}: {action}.", file=sys.stderr)
+            _write_row(csv_writer, csv_file, csv_lock, {"org": org, "repo": full, "action": action})
+
+        def with_missing(stats: OrgStats) -> OrgStats:
+            stats.not_found += sum(1 for _, a in missing if a == "not_found")
+            stats.query_failed += sum(1 for _, a in missing if a != "not_found")
+            if missing:
+                print(f"Targets not found or not readable in '{org}': {len(missing)}")
+            return stats
+
+        if targets is None and not repos:
+            print(f"  No repos returned for '{org}' - skipping.", file=sys.stderr)
+            return OrgStats(org=org)
+
+        if targets is not None:
+            print(f"Resolved {len(repos)} target repo(s) for '{org}'")
+        elif repo_filter_pattern:
+            original_count = len(repos)
+            repos = filter_repos_by_wildcard(repos, repo_filter_pattern)
+            print(f"Filtered to {len(repos)}/{original_count} repos matching '{repo_filter_pattern}'")
+
+        if resume_done:
+            before = len(repos)
+            repos = [r for r in repos if r["nameWithOwner"].lower() not in resume_done]
+            if before != len(repos):
+                print(f"Resume: skipping {before - len(repos)} repo(s) already done in '{org}'")
+
+        if not repos:
+            print(f"  No repos match filter for '{org}' - skipping.", file=sys.stderr)
+            return with_missing(OrgStats(org=org))
+
+        if args.delete:
+            return with_missing(run_delete_mode(
+                org, repos, csv_writer, csv_file, csv_lock, ctx,
+                veracode_profiles, args.workers, args.dry_run, delete_opts,
+            ))
+        return with_missing(run_create_mode(
+            org, repos, csv_writer, csv_file, csv_lock, ctx,
+            args.stale_days, veracode_profiles, args.workers,
+            gate, inflight, args.dry_run, args.rescan_existing,
+        ))
+
+    interrupted = False
     try:
-        with open(output_file, "w", newline="", encoding="utf-8") as csv_file:
+        with open(output_file, open_mode, newline="", encoding="utf-8") as csv_file:
             csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            csv_writer.writeheader()
-            csv_file.flush()
+            if open_mode != "a":
+                csv_writer.writeheader()
+                csv_file.flush()
 
             for org_index, org in enumerate(orgs, start=1):
                 print_org_header(org, org_index, total_orgs)
-
-                repos = fetch_repos(org, args.repo_limit, ctx)
-                if not repos:
-                    print(f"  No repos returned for '{org}' - skipping.", file=sys.stderr)
-                    all_stats.append(OrgStats(org=org))
-                    continue
-
-                original_count = len(repos)
-                if org_repo_pairs:
-                    target_repos = [repo for o, repo in org_repo_pairs if o.lower() == org.lower()]
-                    repos = filter_repos_by_names(repos, target_repos)
-                    print(f"Filtered to {len(repos)}/{original_count} repos from --org-repo-file for '{org}'")
-                elif repo_filter_names:
-                    repos = filter_repos_by_names(repos, repo_filter_names)
-                    print(f"Filtered to {len(repos)}/{original_count} repos matching --repo-file")
-                elif repo_filter_pattern:
-                    repos = filter_repos_by_wildcard(repos, repo_filter_pattern)
-                    print(f"Filtered to {len(repos)}/{original_count} repos matching '{repo_filter_pattern}'")
-
-                if not repos:
-                    print(f"  No repos match filter for '{org}' - skipping.", file=sys.stderr)
-                    all_stats.append(OrgStats(org=org))
-                    continue
-
-                if args.delete:
-                    stats = run_delete_mode(
-                        org, repos, csv_writer, csv_file, csv_lock, ctx,
-                        veracode_profiles, args.workers, args.dry_run,
-                    )
-                else:
-                    stats = run_create_mode(
-                        org, repos, csv_writer, csv_file, csv_lock, ctx,
-                        args.stale_days, veracode_profiles, args.workers,
-                        gate, inflight, args.dry_run, args.rescan_existing,
-                    )
-
+                try:
+                    stats = run_org(org, csv_writer, csv_file)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one org must not kill the run
+                    print(f"  Error: org '{org}' crashed: {exc!r}. Continuing.", file=sys.stderr)
+                    _write_row(csv_writer, csv_file, csv_lock, _org_row(org, "org_crashed"))
+                    stats = OrgStats(org=org, org_failed=1)
                 all_stats.append(stats)
+                if STOP.is_set():
+                    interrupted = True
+                    print(f"\nInterrupted. Remaining {total_orgs - org_index} org(s) not started.", file=sys.stderr)
+                    break
 
     except KeyboardInterrupt:
-        print("\nInterrupted. Partial CSV output may exist.", file=sys.stderr)
-        sys.exit(130)
+        STOP.set()
+        interrupted = True
+        print("\nInterrupted. The CSV has a row for every repo that was touched.", file=sys.stderr)
 
-    if total_orgs > 1 and all_stats:
+    if all_stats:
         print_multi_org_summary(
-            all_stats, args.delete, args.stale_days, use_veracode, output_file,
+            all_stats, args.delete, args.stale_days, use_veracode, output_file, args.dry_run,
         )
+    else:
+        print(f"\nCSV Output: {output_file}")
 
-    print(f"\nCSV Output: {output_file}")
+    code = exit_code(all_stats, interrupted)
+    if code:
+        sys.exit(code)
+
+
+EXIT_OK = 0
+EXIT_FAILURES = 2
+EXIT_INTERRUPTED = 130
+
+
+def exit_code(all_stats: list[OrgStats], interrupted: bool) -> int:
+    if interrupted:
+        return EXIT_INTERRUPTED
+    if any(s.total_failed for s in all_stats):
+        return EXIT_FAILURES
+    return EXIT_OK
 
 
 if __name__ == "__main__":

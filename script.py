@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fnmatch
+import http.client
 import io
 import json
 import os
@@ -18,12 +19,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 ISSUE_TITLE = "Veracode Baseline Scans"
 ISSUE_BODY = "Veracode All Scans"
@@ -436,7 +440,7 @@ class InflightTracker:
                     "-f", "per_page=100",
                     "--jq", _RUNS_JQ,
                 ],
-                self.ctx,
+                self.ctx.for_org(org),
                 cost=COST_READ,
             )
             if not ok:
@@ -527,6 +531,29 @@ class GhContext:
     throttle: Throttle
     min_remaining: int = CORE_MIN_REMAINING
     check_every: int = CORE_CHECK_EVERY
+    app: GitHubAppAuth | None = None  # App mode: gh gets the org's installation token
+    org: str = ""
+    orgs: dict = field(default_factory=dict, repr=False)  # org.lower() -> its context, App mode only
+
+    def for_org(self, org: str) -> GhContext:
+        """Context for one org's gh calls. App mode: that org's token and its own rate-limit
+        state (each installation has its own budget); the throttle stays shared."""
+        if self.app is None:
+            return self
+        key = org.lower()
+        if key not in self.orgs:
+            self.orgs[key] = replace(self, org=org, state=RateLimitState(), orgs={})
+        return self.orgs[key]
+
+    def gh_env(self) -> dict[str, str]:
+        """Env for one gh call. App mode: GH_TOKEN (github.com, GHEC) and GH_ENTERPRISE_TOKEN
+        (GHES) are the org's cached installation token; raises AppAuthError."""
+        if self.app is None:
+            return self.env
+        if not self.org:
+            raise AppAuthError("GitHub App auth needs an org: use ctx.for_org(org)")
+        token = self.app.token(self.org)
+        return {**self.env, "GH_TOKEN": token, "GH_ENTERPRISE_TOKEN": token}
 
 
 @dataclass
@@ -593,6 +620,262 @@ class RepoLogger:
 
     def warn(self, msg: str) -> None:
         self.lines.append(f"[WARN] {msg}")
+
+
+# --------------------------------------------------------------------------- #
+# GitHub App auth: one installation token per org, minted on demand and cached
+# --------------------------------------------------------------------------- #
+class AppAuthError(RuntimeError):
+    """The GitHub App could not get a token (bad key/ID, suspended, API error)."""
+
+
+class AppNotInstalledError(AppAuthError):
+    """The GitHub App is not installed on the org."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # never forward the JWT/token; a 3xx surfaces as HTTPError
+
+
+def _load_app_private_key(value: str) -> str:
+    """PEM text, a one-line PEM with literal \\n (common in .env files), or a path to a .pem file."""
+    text = value.strip()
+    if "-----BEGIN" not in text:
+        path = Path(text).expanduser()
+        if not path.is_file():
+            raise AppAuthError("GITHUB_APP_PRIVATE_KEY must be a PEM private key or the path to a .pem file")
+        text = path.read_text(encoding="utf-8").strip()
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    return text + "\n"
+
+
+class GitHubAppAuth:
+    """Installation tokens for a GitHub App installed on many orgs.
+
+    JWT (RS256) -> GET /orgs/{org}/installation -> POST
+    /app/installations/{id}/access_tokens. Tokens are cached per org and
+    re-minted REFRESH_MARGIN seconds before their 1h expiry. Thread-safe.
+    """
+
+    REFRESH_MARGIN = 600  # renew 10 min early so a long git push or paginated read never outlives the token
+    JWT_TTL = 540  # GitHub rejects app JWTs that live longer than 10 min
+    TIMEOUT = 30
+
+    def __init__(self, app_id: str, private_key: str, api_base: str, user_agent: str = "github-app-auth"):
+        self.app_id = str(app_id).strip()
+        self.private_key = private_key
+        self.api_base = api_base.rstrip("/")
+        self.user_agent = user_agent
+        self._lock = threading.Lock()
+        self._org_locks: dict = {}
+        self._jwt: tuple = ("", 0.0)
+        self._installation_ids: dict = {}  # org.lower() -> installation id
+        self._tokens: dict = {}  # org.lower() -> (token, expires_at epoch, permissions dict)
+        self._not_installed: dict = {}  # org.lower() -> error message, so a missing org costs one lookup
+        self._app: dict = {}
+        self._opener = urllib.request.build_opener(_NoRedirect())
+
+    @classmethod
+    def from_env(cls, api_base: str, user_agent: str = "github-app-auth") -> "GitHubAppAuth | None":
+        """None when neither GITHUB_APP_ID nor GITHUB_APP_PRIVATE_KEY is set (PAT fallback)."""
+        app_id = (os.environ.get("GITHUB_APP_ID") or "").strip()
+        key = os.environ.get("GITHUB_APP_PRIVATE_KEY") or ""
+        if not app_id and not key.strip():
+            return None
+        if not app_id or not key.strip():
+            raise AppAuthError("set both GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY")
+        auth = cls(app_id, _load_app_private_key(key), api_base, user_agent)
+        auth.jwt()  # fail fast on a bad key or a missing PyJWT
+        return auth
+
+    # -- JWT --------------------------------------------------------------- #
+    def jwt(self) -> str:
+        with self._lock:
+            token, exp = self._jwt
+            if token and exp - time.time() > 60:
+                return token
+            try:
+                import jwt as pyjwt
+            except ImportError:
+                raise AppAuthError("GitHub App auth needs PyJWT with crypto: pip install 'PyJWT[crypto]'") from None
+            now = int(time.time())
+            payload = {"iat": now - 60, "exp": now + self.JWT_TTL, "iss": self.app_id}  # iat back-dated for clock skew
+            try:
+                token = pyjwt.encode(payload, self.private_key, algorithm="RS256")
+            except Exception as e:  # bad PEM, wrong key type
+                raise AppAuthError(f"cannot sign the GitHub App JWT: {type(e).__name__}") from None
+            token = token.decode() if isinstance(token, bytes) else token
+            self._jwt = (token, float(now + self.JWT_TTL))
+            return token
+
+    # -- HTTP -------------------------------------------------------------- #
+    def _call(self, method: str, path: str, bearer: str | None, ok404: bool = False):
+        url = path if path.startswith(("https://", "http://")) else self.api_base + path
+        if not url.startswith(self.api_base + "/"):
+            raise AppAuthError(f"refusing to send credentials outside {self.api_base}")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": self.user_agent,
+        }
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        for attempt in range(4):
+            req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method, headers=headers)
+            try:
+                with self._opener.open(req, timeout=self.TIMEOUT) as resp:
+                    raw = resp.read()
+                    return (json.loads(raw) if raw else None), resp.headers
+            except urllib.error.HTTPError as e:
+                status, hdrs, raw = e.code, e.headers, e.read()
+            except (OSError, http.client.HTTPException) as e:
+                if attempt == 3:
+                    raise AppAuthError(f"{method} {path}: network error: {e}") from None
+                time.sleep(2**attempt)
+                continue
+            if status == 404 and ok404:
+                return None, hdrs
+            retry_after = (hdrs.get("Retry-After") or "").strip()
+            limited = status == 429 or (status == 403 and (retry_after or hdrs.get("X-RateLimit-Remaining") == "0"))
+            if attempt < 3 and (status >= 500 or limited):
+                wait = int(retry_after) if retry_after.isdigit() else 2**attempt
+                if hdrs.get("X-RateLimit-Remaining") == "0" and (hdrs.get("X-RateLimit-Reset") or "").isdigit():
+                    wait = int(hdrs["X-RateLimit-Reset"]) - int(time.time()) + 1
+                time.sleep(min(max(wait, 1), 300))
+                continue
+            try:
+                msg = json.loads(raw).get("message", "")
+            except (ValueError, AttributeError):
+                msg = raw[:200].decode(errors="replace")
+            raise AppAuthError(f"{method} {path}: HTTP {status} {msg}".rstrip())
+        raise AppAuthError(f"{method} {path}: gave up after retries")
+
+    def _org_lock(self, key: str) -> threading.Lock:
+        with self._lock:
+            return self._org_locks.setdefault(key, threading.Lock())
+
+    # -- App / installations ----------------------------------------------- #
+    def app(self) -> dict:
+        """GET /app: validates the App ID and key; slug and html_url for messages."""
+        if not self._app:
+            try:
+                self._app = self._call("GET", "/app", self.jwt())[0] or {}
+            except AppAuthError as e:
+                if "HTTP 401" in str(e) or "HTTP 404" in str(e):  # GitHub: "Integration not found"
+                    raise AppAuthError(f"{e} (check GITHUB_APP_ID matches the private key, and the clock)") from None
+                raise
+        return self._app
+
+    def installation_id(self, org: str) -> int:
+        key = org.lower()
+        if key in self._not_installed:
+            raise AppNotInstalledError(self._not_installed[key])
+        if key not in self._installation_ids:
+            data, _ = self._call("GET", f"/orgs/{urllib.parse.quote(org)}/installation", self.jwt(), ok404=True)
+            if not data or not data.get("id"):
+                self.app()  # a wrong App ID also 404s here: report that, not "not installed"
+                self._not_installed[key] = (
+                    f"GitHub App {self.app_id} is not installed on org '{org}'; install it on the org "
+                    f"({self._app.get('html_url') or 'App settings'}/installations/new) and re-run"
+                )
+                raise AppNotInstalledError(self._not_installed[key])
+            if data.get("suspended_at"):
+                self._not_installed[key] = f"GitHub App {self.app_id} installation on org '{org}' is suspended"
+                raise AppNotInstalledError(self._not_installed[key])
+            self._installation_ids[key] = int(data["id"])
+        return self._installation_ids[key]
+
+    def installed_orgs(self) -> list:
+        """Logins of every org the App is installed on (not suspended), for 'all orgs' runs."""
+        orgs, url = [], "/app/installations?per_page=100"
+        while url:
+            data, hdrs = self._call("GET", url, self.jwt())
+            for inst in data or []:
+                account = inst.get("account") or {}
+                if inst.get("target_type") == "Organization" and not inst.get("suspended_at") and account.get("login"):
+                    orgs.append(account["login"])
+                    self._installation_ids[account["login"].lower()] = int(inst["id"])
+            m = re.search(r'<([^>]+)>;\s*rel="next"', hdrs.get("Link") or "")
+            url = m.group(1) if m else ""
+        return orgs
+
+    # -- Installation tokens ----------------------------------------------- #
+    def _cached(self, key: str):
+        entry = self._tokens.get(key)
+        return entry if entry and entry[1] - time.time() > self.REFRESH_MARGIN else None
+
+    def token(self, org: str) -> str:
+        """A valid installation token (ghs_...) for org, minted at most once per ~50 min."""
+        return self._entry(org)[0]
+
+    def permissions(self, org: str) -> dict:
+        """Permissions granted to the org's token, e.g. {'contents': 'write', 'workflows': 'write'}."""
+        return dict(self._entry(org)[2])
+
+    def _entry(self, org: str):
+        key = org.lower()
+        entry = self._cached(key)
+        if entry:
+            return entry
+        with self._org_lock(key):  # one mint per org even with many worker threads
+            entry = self._cached(key)
+            if entry:
+                return entry
+            for attempt in (0, 1):
+                inst = self.installation_id(org)
+                try:
+                    data, _ = self._call("POST", f"/app/installations/{inst}/access_tokens", self.jwt())
+                    break
+                except AppAuthError as e:
+                    if attempt == 0 and "HTTP 404" in str(e):  # uninstalled and maybe reinstalled since lookup
+                        self._installation_ids.pop(key, None)
+                        continue
+                    raise AppAuthError(f"cannot mint a token for org '{org}': {e}") from None
+            token = (data or {}).get("token")
+            if not token:
+                raise AppAuthError(f"cannot mint a token for org '{org}': no token in the response")
+            try:
+                expires = self._epoch((data or {}).get("expires_at"))
+            except (TypeError, ValueError):
+                expires = time.time() + 3600
+            entry = (token, expires, (data or {}).get("permissions") or {})
+            self._tokens[key] = entry
+            return entry
+
+    def invalidate(self, org: str) -> None:
+        """Drop the cached token after a 401 so the next call mints a new one."""
+        self._tokens.pop(org.lower(), None)
+
+    def bot_identity(self, token: str | None = None) -> tuple:
+        """(login, noreply email) of the App's bot user, for commit authorship.
+        Pass an installation token where anonymous API reads are disabled (GHES private mode)."""
+        slug = self.app().get("slug") or ""
+        if not slug:
+            raise AppAuthError("GET /app returned no slug")
+        login = f"{slug}[bot]"
+        data, _ = self._call("GET", f"/users/{urllib.parse.quote(login)}", token, ok404=True)
+        if not data or not data.get("id"):
+            raise AppAuthError(f"cannot look up the bot user {login}")
+        return login, f"{data['id']}+{login}@users.noreply.github.com"
+
+    @staticmethod
+    def _epoch(value) -> float:
+        """Epoch seconds from GitHub's ISO-8601 timestamp ('2026-01-01T00:00:00Z')."""
+        from datetime import datetime as _datetime
+
+        return _datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+def github_api_base(gh_hostname: str | None) -> str:
+    """REST API root for --hostname: github.com, GHEC data residency (*.ghe.com) or GHES."""
+    host = (gh_hostname or "github.com").strip().lower().removeprefix("https://").rstrip("/")
+    if host == "github.com":
+        return "https://api.github.com"
+    if host.endswith(".ghe.com"):
+        return f"https://api.{host}"
+    return f"https://{host}/api/v3"
 
 
 def build_gh_env(gh_hostname: str | None) -> dict[str, str]:
@@ -725,7 +1008,7 @@ def query_rate_limit(ctx: GhContext) -> bool:
             encoding="utf-8",
             errors="replace",
             check=True,
-            env=ctx.env,
+            env=ctx.gh_env(),
             timeout=SUBPROCESS_TIMEOUT,
         )
         lines = (result.stdout or "").strip().splitlines()
@@ -742,7 +1025,7 @@ def query_rate_limit(ctx: GhContext) -> bool:
                 ctx.state.reset_epoch = gql_reset
                 ctx.state.bucket = "graphql"
         return True
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, AppAuthError):
         return False
 
 
@@ -865,6 +1148,11 @@ def _is_rate_limited(text: str) -> bool:
     return any(pat in lowered for pat in _RATE_LIMIT_PATTERNS)
 
 
+def _is_bad_credentials(text: str) -> bool:
+    lowered = text.lower()
+    return "bad credentials" in lowered or "http 401" in lowered
+
+
 def _is_auth_failure(text: str) -> bool:
     lowered = text.lower()
     return any(pat in lowered for pat in _AUTH_FAILURE_PATTERNS)
@@ -884,7 +1172,15 @@ def gh_call(
     for attempt in range(max_retries + 1):
         maybe_pause_for_rate_limit(ctx)
         ctx.throttle.acquire(cost)
-        success, stdout, stderr = _run_subprocess(args, ctx.env, timeout=timeout)
+        try:
+            success, stdout, stderr = _run_subprocess(args, ctx.gh_env(), timeout=timeout)
+            if not success and ctx.app is not None and _is_bad_credentials(stderr):
+                # Token revoked or expired early: GitHub did nothing, so mint a new one and retry once.
+                ctx.app.invalidate(ctx.org)
+                success, stdout, stderr = _run_subprocess(args, ctx.gh_env(), timeout=timeout)
+        except AppAuthError as exc:
+            print(f"GitHub App auth: {exc}", file=sys.stderr)
+            return False, "", str(exc)
 
         if success:
             # Only GraphQL can fail with exit 0. REST bodies (check runs,
@@ -2658,16 +2954,24 @@ def main() -> None:
     if shutil.which("gh") is None:
         sys.exit("Error: GitHub CLI (gh) is not installed.")
 
-    if os.environ.get("GITHUB_ACTIONS") == "true":
+    gh_hostname = args.hostname
+    try:
+        app = GitHubAppAuth.from_env(github_api_base(gh_hostname), "veracode-bulk-scan-trigger")
+        if app is not None:
+            app_info = app.app()  # fail fast on a wrong App ID or key
+            print(f"Authenticating as GitHub App '{app_info.get('slug') or app.app_id}' (a token per org).")
+    except AppAuthError as exc:
+        sys.exit(f"Error: GitHub App auth failed: {exc}")
+
+    if app is None and os.environ.get("GITHUB_ACTIONS") == "true":
         print(
             "Warning: running inside GitHub Actions. Issues created with GITHUB_TOKEN "
-            "do NOT trigger workflow runs, so no scans will start. Use a PAT or a "
-            "GitHub App token in GH_TOKEN.",
+            "do NOT trigger workflow runs, so no scans will start. Set GITHUB_APP_ID and "
+            "GITHUB_APP_PRIVATE_KEY, or put a GitHub App or PAT token in GH_TOKEN.",
             file=sys.stderr,
         )
 
-    gh_hostname = args.hostname
-    if gh_hostname and "ghe.com" not in gh_hostname and not os.environ.get("GH_ENTERPRISE_TOKEN"):
+    if app is None and gh_hostname and "ghe.com" not in gh_hostname and not os.environ.get("GH_ENTERPRISE_TOKEN"):
         print(
             f"Warning: --hostname is '{gh_hostname}' but GH_ENTERPRISE_TOKEN is not set.",
             file=sys.stderr,
@@ -2690,6 +2994,7 @@ def main() -> None:
         throttle=throttle,
         min_remaining=args.min_remaining,
         check_every=args.rl_check_every,
+        app=app,
     )
 
     gate = CreateGate(
@@ -2761,7 +3066,7 @@ def main() -> None:
 
     if args.strict_orgs:
         print("\nChecking access to all organizations (--strict-orgs)...")
-        inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx)]
+        inaccessible_orgs = [org for org in orgs if not _check_and_report(org, ctx.for_org(org))]
         if inaccessible_orgs:
             sys.exit(
                 f"\nError: Cannot access org(s): {', '.join(inaccessible_orgs)}. "
@@ -2820,6 +3125,15 @@ def main() -> None:
     csv_lock = threading.Lock()
 
     def run_org(org: str, csv_writer: csv.DictWriter, csv_file) -> OrgStats:
+        octx = ctx.for_org(org)
+        if octx.app is not None:
+            try:
+                octx.app.token(org)  # one lookup per org; a missing install is cached
+            except AppAuthError as exc:
+                action = "app_not_installed" if isinstance(exc, AppNotInstalledError) else "app_auth_failed"
+                print(f"  Error: {exc}. Continuing with the next org.", file=sys.stderr)
+                _write_row(csv_writer, csv_file, csv_lock, _org_row(org, action))
+                return OrgStats(org=org, org_failed=1)
         targets: list[str] | None = None
         if org_repo_pairs:
             targets = [repo for o, repo in org_repo_pairs if o.lower() == org.lower()]
@@ -2829,15 +3143,15 @@ def main() -> None:
         missing: list[tuple[str, str]] = []
         org_action: str | None = None
         if targets is not None:
-            repos, missing = resolve_targets(org, targets, args.repo_limit, ctx, resume_done)
-            if repos is not None and not repos and missing and not check_org_access(org, ctx):
+            repos, missing = resolve_targets(org, targets, args.repo_limit, octx, resume_done)
+            if repos is not None and not repos and missing and not check_org_access(org, octx):
                 # Every target 404'd because the org itself is out of reach.
                 repos, missing, org_action = None, [], "org_inaccessible"
         else:
-            repos = fetch_repos(org, args.repo_limit, ctx)
+            repos = fetch_repos(org, args.repo_limit, octx)
         if repos is None:
             # Only now spend a call to tell "no access" from "list failed".
-            action = org_action or ("org_list_failed" if check_org_access(org, ctx) else "org_inaccessible")
+            action = org_action or ("org_list_failed" if check_org_access(org, octx) else "org_inaccessible")
             print(f"  Error: {action} for '{org}'. Continuing with the next org.", file=sys.stderr)
             _write_row(csv_writer, csv_file, csv_lock, _org_row(org, action))
             return OrgStats(org=org, org_failed=1)
@@ -2876,11 +3190,11 @@ def main() -> None:
 
         if args.delete:
             return with_missing(run_delete_mode(
-                org, repos, csv_writer, csv_file, csv_lock, ctx,
+                org, repos, csv_writer, csv_file, csv_lock, octx,
                 veracode_profiles, args.workers, args.dry_run, delete_opts,
             ))
         return with_missing(run_create_mode(
-            org, repos, csv_writer, csv_file, csv_lock, ctx,
+            org, repos, csv_writer, csv_file, csv_lock, octx,
             args.stale_days, veracode_profiles, args.workers,
             gate, inflight, args.dry_run, args.rescan_existing,
         ))

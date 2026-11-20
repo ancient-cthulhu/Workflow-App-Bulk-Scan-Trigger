@@ -76,7 +76,7 @@ gh --version      # GitHub CLI v2+
 python --version  # Python 3.9+
 ```
 
-Stdlib only by default. `--veracode-skip-existing` additionally requires:
+Stdlib only by default. GitHub App auth needs `pip install "PyJWT[crypto]"`. `--veracode-skip-existing` additionally requires:
 
 ```bash
 pip install veracode-api-signing requests
@@ -86,7 +86,23 @@ pip install veracode-api-signing requests
 
 ## Credentials
 
-### GitHub.com and GHEC
+### GitHub App (multi-org)
+
+```bash
+export GITHUB_APP_ID=123456
+export GITHUB_APP_PRIVATE_KEY="$(cat app.private-key.pem)"
+```
+
+`GITHUB_APP_PRIVATE_KEY` takes the PEM text, the PEM on one line with `\n`, or a path to the `.pem` file. The script signs a JWT, looks up each org's installation (`GET /orgs/{org}/installation`), mints a 1-hour installation token per org and caches it, renewing 10 minutes before expiry. Orgs where the App is not installed (or suspended) are reported and skipped; the run continues. Needs `pip install "PyJWT[crypto]"`. Each `gh` call gets that org's token in `GH_TOKEN` / `GH_ENTERPRISE_TOKEN`, so no `gh auth login` is needed (GHES and GHE.com included, via `--hostname`). An org without the App gets an `app_not_installed` CSV row and counts as a failure. Issues are opened by `<app-slug>[bot]`.
+
+|Permission|Access|Why|
+|---|---|---|
+|Issues|Read and write|create, comment on and close trigger issues|
+|Administration|Read and write|enable Issues where disabled, then restore|
+|Checks|Read|`--stale-days`|
+|Actions|Read|`--max-inflight` (central `veracode` repo)|
+
+### Personal access token: GitHub.com and GHEC
 
 ```bash
 gh auth login
@@ -96,7 +112,7 @@ export GH_TOKEN=ghp_yourtoken
 
 Use a token dedicated to this script. Do not reuse the Workflow App's token, and never use a workflow's `GITHUB_TOKEN`.
 
-### GitHub Enterprise Server (GHES)
+### Personal access token: GitHub Enterprise Server (GHES)
 
 ```bash
 gh auth login --hostname github.mycompany.com
@@ -125,7 +141,7 @@ The API account needs read access to the Applications API (Security Lead, Review
 
 Without `--veracode-region`, the region is read from the `VERACODE_API_KEY_ID` prefix (`vera01ei-...` = eu, `vera01fi-...` = federal, `vera01gi-...` or no prefix = commercial). An explicit `--veracode-region` that contradicts the key prints a warning. Keys read only from `~/.veracode/credentials` are not inspected, so pass `--veracode-region` for non-commercial accounts in that case.
 
-### Required Permissions
+### Required Permissions (personal access token)
 
 Use a classic personal access token with these scopes:
 
